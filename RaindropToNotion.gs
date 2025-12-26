@@ -1194,7 +1194,7 @@ function updateNotionPage(pageId, bookmark) {
     muteHttpExceptions: true
   };
   
-  return makeRequestWithRetry(() => {
+  const result = makeRequestWithRetry(() => {
     const response = UrlFetchApp.fetch(url, options);
     const code = response.getResponseCode();
     
@@ -1210,6 +1210,142 @@ function updateNotionPage(pageId, bookmark) {
     
     return JSON.parse(response.getContentText());
   });
+  
+  // Update page content (note/excerpt) if enabled - always call to handle deletions
+  if (CONFIG.ENABLE_PAGE_CONTENT) {
+    try {
+      updatePageContentWithExcerptAndNote(pageId, bookmark);
+    } catch (error) {
+      Logger.log(`  ⚠️ Failed to update page content: ${error.message}`);
+    }
+  }
+  
+  return result;
+}
+
+/**
+ * Update page content with both excerpt and note (matching create behavior)
+ * @param {string} pageId - Notion page ID
+ * @param {Object} bookmark - Bookmark object with excerpt and/or note
+ */
+function updatePageContentWithExcerptAndNote(pageId, bookmark) {
+  try {
+    // First, get existing blocks
+    const blocksUrl = `${CONFIG.NOTION_API_BASE}/blocks/${pageId}/children`;
+    const getOptions = {
+      method: 'get',
+      headers: {
+        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
+        'Notion-Version': CONFIG.NOTION_API_VERSION
+      },
+      muteHttpExceptions: true
+    };
+    
+    const getResponse = UrlFetchApp.fetch(blocksUrl, getOptions);
+    const existingBlocks = JSON.parse(getResponse.getContentText());
+    
+    // Delete existing content blocks (paragraphs and quotes)
+    if (existingBlocks.results) {
+      for (const block of existingBlocks.results) {
+        if (block.type === 'paragraph' || block.type === 'quote') {
+          try {
+            deleteNotionBlock(block.id);
+            Utilities.sleep(100);
+          } catch (error) {
+            Logger.log(`Warning: Could not delete block ${block.id}: ${error.message}`);
+          }
+        }
+      }
+    }
+    
+    // Build new content blocks (matching createNotionPage behavior)
+    const newBlocks = [];
+    const maxChunkSize = 1900;
+    
+    // Add excerpt as paragraph
+    if (bookmark.excerpt) {
+      if (bookmark.excerpt.length <= maxChunkSize) {
+        newBlocks.push({
+          object: 'block',
+          type: 'paragraph',
+          paragraph: {
+            rich_text: [{
+              type: 'text',
+              text: { content: bookmark.excerpt }
+            }]
+          }
+        });
+      } else {
+        // Split into chunks if too long
+        let remaining = bookmark.excerpt;
+        while (remaining.length > 0) {
+          const chunk = remaining.substring(0, maxChunkSize);
+          remaining = remaining.substring(maxChunkSize);
+          newBlocks.push({
+            object: 'block',
+            type: 'paragraph',
+            paragraph: {
+              rich_text: [{
+                type: 'text',
+                text: { content: chunk }
+              }]
+            }
+          });
+        }
+      }
+    }
+    
+    // Add note as quote block
+    if (bookmark.note) {
+      if (bookmark.note.length <= maxChunkSize) {
+        newBlocks.push({
+          object: 'block',
+          type: 'quote',
+          quote: {
+            rich_text: [{
+              type: 'text',
+              text: { content: bookmark.note }
+            }]
+          }
+        });
+      } else {
+        // Split into chunks if too long
+        let remaining = bookmark.note;
+        while (remaining.length > 0) {
+          const chunk = remaining.substring(0, maxChunkSize);
+          remaining = remaining.substring(maxChunkSize);
+          newBlocks.push({
+            object: 'block',
+            type: 'quote',
+            quote: {
+              rich_text: [{
+                type: 'text',
+                text: { content: chunk }
+              }]
+            }
+          });
+        }
+      }
+    }
+    
+    // Add new content blocks
+    if (newBlocks.length > 0) {
+      const addOptions = {
+        method: 'patch',
+        headers: {
+          'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
+          'Notion-Version': CONFIG.NOTION_API_VERSION,
+          'Content-Type': 'application/json'
+        },
+        payload: JSON.stringify({ children: newBlocks }),
+        muteHttpExceptions: true
+      };
+      
+      UrlFetchApp.fetch(blocksUrl, addOptions);
+    }
+  } catch (error) {
+    Logger.log(`Warning: Could not update page content: ${error.message}`);
+  }
 }
 
 /**
@@ -1964,6 +2100,54 @@ function bookmarkNeedsUpdate(pageId, bookmark) {
     const newCoverUrl = bookmark.cover ? (typeof bookmark.cover === 'string' ? bookmark.cover : bookmark.cover?.url) : '';
     if (currentCover !== newCoverUrl) return true;
     
+    // Check note/excerpt content if enabled
+    if (CONFIG.ENABLE_PAGE_CONTENT) {
+      // Get the page's content blocks to compare note/excerpt
+      try {
+        const blocksUrl = `${CONFIG.NOTION_API_BASE}/blocks/${pageId}/children`;
+        const blockOptions = {
+          method: 'get',
+          headers: {
+            'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
+            'Notion-Version': CONFIG.NOTION_API_VERSION
+          },
+          muteHttpExceptions: true
+        };
+        
+        const blockResponse = UrlFetchApp.fetch(blocksUrl, blockOptions);
+        const blocks = JSON.parse(blockResponse.getContentText());
+        
+        // Extract current content from blocks (both paragraph and quote blocks)
+        let currentContent = '';
+        if (blocks.results) {
+          for (const block of blocks.results) {
+            if (block.type === 'paragraph' && block.paragraph?.rich_text) {
+              // Concatenate all rich_text elements in the paragraph
+              for (const text of block.paragraph.rich_text) {
+                currentContent += text.plain_text || '';
+              }
+            } else if (block.type === 'quote' && block.quote?.rich_text) {
+              // Concatenate all rich_text elements in the quote
+              for (const text of block.quote.rich_text) {
+                currentContent += text.plain_text || '';
+              }
+            }
+          }
+        }
+        
+        // Build expected content from bookmark (excerpt + note)
+        let newContent = '';
+        if (bookmark.excerpt) newContent += bookmark.excerpt;
+        if (bookmark.note) newContent += bookmark.note;
+        
+        if (currentContent.trim() !== newContent.trim()) {
+          return true;
+        }
+      } catch (error) {
+        Logger.log(`  ⚠️ Could not check content blocks: ${error.message}`);
+      }
+    }
+    
     return false; // No changes detected
     
   } catch (error) {
@@ -2539,6 +2723,12 @@ function addTweetsToParentPage(parentId, tweets) {
       
       if (code === 200) {
         Logger.log(`✓ Added ${newTweets.length} new tweets to parent page`);
+        
+        // Update the parent page's "Date Saved" property to the latest tweet's date
+        // Use all tweets (not just newTweets) to find the absolute latest
+        const latestTweet = tweets.sort((a, b) => new Date(b.created) - new Date(a.created))[0];
+        updateParentPageDateSaved(parentId, latestTweet.created);
+        
         return newTweets.length;
       } else {
         Logger.log(`❌ Error adding tweets to parent page: ${code} - ${response.getContentText()}`);
@@ -2551,6 +2741,49 @@ function addTweetsToParentPage(parentId, tweets) {
   } catch (error) {
     Logger.log(`❌ Error in addTweetsToParentPage: ${error.message}`);
     return 0;
+  }
+}
+
+/**
+ * Update the Date Saved property of a parent page to reflect the latest tweet
+ * @param {string} pageId - ID of the parent page to update
+ * @param {string} dateString - ISO date string of the latest tweet
+ */
+function updateParentPageDateSaved(pageId, dateString) {
+  try {
+    const url = `${CONFIG.NOTION_API_BASE}/pages/${pageId}`;
+    
+    const payload = {
+      properties: {
+        'Date Saved': {
+          date: {
+            start: dateString
+          }
+        }
+      }
+    };
+    
+    const options = {
+      method: 'patch',
+      headers: {
+        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
+        'Notion-Version': CONFIG.NOTION_API_VERSION,
+        'Content-Type': 'application/json'
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+    
+    const response = UrlFetchApp.fetch(url, options);
+    const code = response.getResponseCode();
+    
+    if (code === 200) {
+      Logger.log(`  ✓ Updated parent page Date Saved to ${formatDate(dateString)}`);
+    } else {
+      Logger.log(`  ⚠️ Warning: Could not update Date Saved: ${code} - ${response.getContentText()}`);
+    }
+  } catch (error) {
+    Logger.log(`  ⚠️ Warning: Error updating Date Saved: ${error.message}`);
   }
 }
 
