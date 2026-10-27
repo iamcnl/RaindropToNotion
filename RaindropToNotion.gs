@@ -40,7 +40,6 @@ const CONFIG = {
   // Trigger settings
   TRIGGER_HOUR: 20, // 8:00 PM (24-hour format)
   TRIGGER_FUNCTION_NAME: 'syncRaindropToNotion',
-
 };
 
 
@@ -48,27 +47,300 @@ const CONFIG = {
 // MAIN FUNCTIONS
 // ============================================================================
 
+const TWITTER_ICON_URL = 'https://abs.twimg.com/icons/apple-touch-icon-192x192.png';
+const TWEET_ID_LABEL = '🆔 Raindrop ID:';
 
 // Error tracking for logging
 let syncErrors = [];
 let syncWarnings = [];
 
 
+// ============================================================================
+// HTTP LAYER
+// ============================================================================
+
+const MAX_RETRY_DELAY_MS = 30000;
+
+function headerValue(headers, name) {
+  const key = Object.keys(headers || {}).find(k => k.toLowerCase() === name.toLowerCase());
+  return key ? headers[key] : undefined;
+}
+
+function retryDelay(response, attempt) {
+  const retryAfter = parseFloat(headerValue(response.getHeaders(), 'Retry-After'));
+  if (retryAfter > 0) return Math.min(retryAfter * 1000, MAX_RETRY_DELAY_MS);
+  if (response.getResponseCode() === 429) return CONFIG.DELAY_ON_RATE_LIMIT;
+  return 1000 * attempt;
+}
+
+/**
+ * Send an HTTP request and return the parsed JSON body.
+ * Retries 429 always, and 5xx and network errors only when idempotent.
+ * Throws an Error with a `status` property on any non-2xx response.
+ */
+function sendRequest(service, url, { method = 'get', headers = {}, body, idempotent = true } = {}) {
+  const options = { method: method, headers: headers, muteHttpExceptions: true };
+  if (body !== undefined) {
+    options.headers = { ...headers, 'Content-Type': 'application/json' };
+    options.payload = JSON.stringify(body);
+  }
+
+  const attempts = Math.max(1, CONFIG.MAX_RETRIES);
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let response;
+
+    try {
+      response = UrlFetchApp.fetch(url, options);
+    } catch (error) {
+      lastError = error;
+      if (!idempotent || attempt === attempts) throw error;
+      Logger.log(`Retry ${attempt}/${attempts}: ${error.message}`);
+      Utilities.sleep(1000 * attempt);
+      continue;
+    }
+
+    const code = response.getResponseCode();
+    if (code >= 200 && code < 300) {
+      const text = response.getContentText();
+      return text ? JSON.parse(text) : {};
+    }
+
+    lastError = new Error(`${service} API error: ${code} - ${response.getContentText()}`);
+    lastError.status = code;
+
+    const retryable = code === 429 || (idempotent && code >= 500);
+    if (!retryable || attempt === attempts) throw lastError;
+
+    Logger.log(`⚠️ ${service} API returned ${code}, retry ${attempt}/${attempts}`);
+    Utilities.sleep(retryDelay(response, attempt));
+  }
+
+  throw lastError;
+}
+
+function notionRequest(method, path, body, options = {}) {
+  return sendRequest('Notion', `${CONFIG.NOTION_API_BASE}${path}`, {
+    method: method,
+    headers: {
+      'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
+      'Notion-Version': CONFIG.NOTION_API_VERSION
+    },
+    body: body,
+    ...options
+  });
+}
+
+function raindropRequest(path) {
+  return sendRequest('Raindrop', `${CONFIG.RAINDROP_API_BASE}${path}`, {
+    headers: { 'Authorization': `Bearer ${CONFIG.RAINDROP_API_TOKEN}` }
+  });
+}
+
+// ============================================================================
+// PAGINATION
+// ============================================================================
+
+function* paginateNotion(fetchPage, delayMs) {
+  let cursor;
+
+  do {
+    const data = fetchPage(cursor);
+    for (const item of data.results || []) {
+      yield item;
+    }
+
+    cursor = data.has_more ? data.next_cursor : undefined;
+    if (cursor && delayMs) {
+      Utilities.sleep(delayMs);
+    }
+  } while (cursor);
+}
+
+function queryDatabase(filter, { pageSize = 100, delayMs = 300 } = {}) {
+  return paginateNotion(cursor => {
+    const body = { page_size: pageSize };
+    if (filter) body.filter = filter;
+    if (cursor) body.start_cursor = cursor;
+    return notionRequest('post', `/databases/${CONFIG.NOTION_DATABASE_ID}/query`, body);
+  }, delayMs);
+}
+
+function listBlockChildren(blockId, delayMs = 200) {
+  return paginateNotion(cursor => {
+    const query = cursor ? `?start_cursor=${encodeURIComponent(cursor)}&page_size=100` : '?page_size=100';
+    return notionRequest('get', `/blocks/${blockId}/children${query}`);
+  }, delayMs);
+}
+
+function* raindropPages(delayMs = 0) {
+  for (let page = 0; ; page++) {
+    const response = fetchRaindropBookmarks(page);
+
+    if (!response || !Array.isArray(response.items)) {
+      throw new Error(`Unexpected Raindrop response on page ${page}`);
+    }
+    if (response.items.length === 0) return;
+
+    yield { page: page, items: response.items };
+
+    if (response.items.length < CONFIG.RAINDROP_PAGE_SIZE) return;
+    if (delayMs) Utilities.sleep(delayMs);
+  }
+}
+
+// ============================================================================
+// NOTION BLOCK AND PROPERTY BUILDERS
+// ============================================================================
+
+function splitText(text, size = CONFIG.MAX_TEXT_CHUNK) {
+  const chunks = [];
+  let start = 0;
+
+  while (start < text.length) {
+    let end = Math.min(start + size, text.length);
+    const lastUnit = text.charCodeAt(end - 1);
+    if (end < text.length && lastUnit >= 0xD800 && lastUnit <= 0xDBFF) end--;
+    chunks.push(text.substring(start, end));
+    start = end;
+  }
+
+  return chunks;
+}
+
+function richText(content, link) {
+  return [{ type: 'text', text: link ? { content: content, link: { url: link } } : { content: content } }];
+}
+
+function block(type, richTextItems) {
+  return { object: 'block', type: type, [type]: { rich_text: richTextItems } };
+}
+
+function emptyParagraph() {
+  return block('paragraph', []);
+}
+
+function textBlocks(type, text) {
+  if (!text) return [];
+  return splitText(text).map(chunk => block(type, richText(chunk)));
+}
+
+function blockText(b) {
+  return (b[b.type]?.rich_text || []).map(t => t.plain_text || '').join('');
+}
+
+function contentBlocksText(blocks) {
+  return blocks
+    .filter(b => b.type === 'paragraph' || b.type === 'quote')
+    .map(blockText)
+    .join('');
+}
+
+function bookmarkContentBlocks(bookmark) {
+  return [
+    ...textBlocks('paragraph', bookmark.excerpt),
+    ...textBlocks('quote', bookmark.note)
+  ].slice(0, CONFIG.MAX_BLOCKS_PER_REQUEST);
+}
+
+function buildTweetBlocks(tweet) {
+  const trailer = [
+    block('paragraph', richText(`📅 Saved: ${formatDate(tweet.created)} | ${TWEET_ID_LABEL} ${tweet._id}`)),
+    block('paragraph', richText(tweet.link, tweet.link)),
+    emptyParagraph(),
+    emptyParagraph(),
+    emptyParagraph()
+  ];
+
+  const content = [
+    ...textBlocks('paragraph', tweet.title),
+    ...textBlocks('paragraph', tweet.excerpt),
+    ...textBlocks('quote', tweet.note)
+  ].slice(0, CONFIG.MAX_BLOCKS_PER_REQUEST - trailer.length);
+
+  return [...content, ...trailer];
+}
+
+function titleProperty(text) {
+  return { title: richText(text) };
+}
+
+function richTextProperty(text) {
+  return { rich_text: richText(text) };
+}
+
+function selectProperty(name) {
+  return { select: { name: name } };
+}
+
+function multiSelectProperty(names) {
+  return { multi_select: names.map(name => ({ name: name })) };
+}
+
+function dateProperty(start) {
+  return { date: { start: start } };
+}
+
+function urlProperty(url) {
+  return { url: url };
+}
+
+function externalFile(url) {
+  return { type: 'external', external: { url: url } };
+}
+
+function pageTitle(bookmark) {
+  return splitText(bookmark.title || bookmark.link || 'Untitled')[0];
+}
+
+function bookmarkCoverUrl(bookmark) {
+  if (!bookmark.cover) return '';
+  return (typeof bookmark.cover === 'string' ? bookmark.cover : bookmark.cover.url) || '';
+}
+
+function coverAndIcon(bookmark) {
+  const url = bookmarkCoverUrl(bookmark);
+  const result = {};
+  if (!url) return result;
+  if (CONFIG.ENABLE_COVERS) result.cover = externalFile(url);
+  if (CONFIG.ENABLE_ICONS) result.icon = externalFile(url);
+  return result;
+}
+
+function bookmarkProperties(bookmark, titlePropName) {
+  return {
+    [titlePropName]: titleProperty(pageTitle(bookmark)),
+    'Type': selectProperty(bookmark.type || 'link'),
+    'Collection': selectProperty(bookmark.collectionName || 'Unsorted'),
+    'Tags': multiSelectProperty(bookmark.tags || [])
+  };
+}
+
+function collectTags(bookmarks) {
+  const tags = new Set();
+  for (const bookmark of bookmarks) {
+    if (Array.isArray(bookmark.tags)) {
+      bookmark.tags.forEach(tag => tags.add(tag));
+    }
+  }
+  return Array.from(tags);
+}
+
+
+// ============================================================================
+// MAIN FUNCTIONS
+// ============================================================================
+
 function setupDatabaseProperties() {
   validateConfiguration(['NOTION_API_TOKEN', 'NOTION_DATABASE_ID']);
   Logger.log('Setting up Notion database properties...');
-  
-  const url = `${CONFIG.NOTION_API_BASE}/databases/${CONFIG.NOTION_DATABASE_ID}`;
-  
+
   // Do not attempt to create/rename the title property. We'll use whatever the DB already has.
   // Only ensure our custom properties exist.
   const properties = {
-    'Raindrop ID': {
-      rich_text: {}
-    },
-    'URL': {
-      url: {}
-    },
+    'Raindrop ID': { rich_text: {} },
+    'URL': { url: {} },
     'Type': {
       select: {
         options: [
@@ -83,49 +355,20 @@ function setupDatabaseProperties() {
         ]
       }
     },
-    'Collection': {
-      select: {}
-    },
-    'Tags': {
-      multi_select: {}
-    },
-    'Date Saved': {
-      date: {}
-    }
+    'Collection': { select: {} },
+    'Tags': { multi_select: {} },
+    'Date Saved': { date: {} }
   };
-  
-  const payload = {
-    properties: properties
-  };
-  
-  const options = {
-    method: 'patch',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-      'Notion-Version': CONFIG.NOTION_API_VERSION,
-      'Content-Type': 'application/json'
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-  
+
   try {
-    const response = UrlFetchApp.fetch(url, options);
-    const code = response.getResponseCode();
-    
-    if (code === 200) {
-      Logger.log('✓ Database properties configured successfully');
-      return true;
-    } else {
-      Logger.log(`❌ Error: ${code} - ${response.getContentText()}`);
-      return false;
-    }
+    notionRequest('patch', `/databases/${CONFIG.NOTION_DATABASE_ID}`, { properties: properties });
+    Logger.log('✓ Database properties configured successfully');
+    return true;
   } catch (error) {
     Logger.log(`❌ Error setting up database: ${error.message}`);
     return false;
   }
 }
-
 
 function syncRaindropToNotion() {
   const startTime = new Date().getTime();
@@ -198,14 +441,12 @@ function syncRaindropToNotion() {
     const twitterParents = {}; // Maps @username to Notion page ID
     
     // Fetch all bookmarks from Raindrop.io
-    let page = 0;
     let totalProcessed = 0;
     let totalSkipped = 0;
     let totalCreated = 0;
     let totalUpdated = 0;
-    let hasMore = true;
-    
-    while (hasMore) {
+
+    for (const { page, items: bookmarks } of raindropPages(CONFIG.DELAY_BETWEEN_BATCHES)) {
       // Check execution time limit
       const elapsed = new Date().getTime() - startTime;
       if (elapsed > CONFIG.MAX_EXECUTION_TIME) {
@@ -213,101 +454,51 @@ function syncRaindropToNotion() {
         Logger.log('Script will resume on next trigger.');
         break;
       }
-      
-      // Fetch a page of bookmarks
-      const response = fetchRaindropBookmarks(page);
-      if (!response || !response.items || response.items.length === 0) {
-        hasMore = false;
-        break;
-      }
-      
-  const bookmarks = response.items;
-  // Enrich bookmarks with derived metadata (collection name, type, tags)
-  enrichBookmarksMetadata(bookmarks);
+
+      // Enrich bookmarks with derived metadata (collection name, type, tags)
+      enrichBookmarksMetadata(bookmarks);
       Logger.log(`\nProcessing page ${page}: ${bookmarks.length} bookmarks`);
-      
-      // Separate bookmarks into new, existing, and to-update
-      const newBookmarks = [];
-      const existingBookmarks = [];
-      
-      for (const bookmark of bookmarks) {
-        const raindropId = bookmark._id.toString();
-        if (!existingIds.has(raindropId)) {
-          newBookmarks.push(bookmark);
-        } else {
-          existingBookmarks.push(bookmark);
-        }
-      }
-      
+
+      const newBookmarks = bookmarks.filter(b => !existingIds.has(b._id.toString()));
+      const existingBookmarks = bookmarks.filter(b => existingIds.has(b._id.toString()));
+
       Logger.log(`New bookmarks to import: ${newBookmarks.length}`);
       Logger.log(`Existing bookmarks to check for updates: ${existingBookmarks.length}`);
       totalSkipped += bookmarks.length - newBookmarks.length - existingBookmarks.length;
-      
+
       // Check existing bookmarks for updates
       if (existingBookmarks.length > 0 && CONFIG.ENABLE_UPDATE_CHECK) {
         Logger.log(`Checking ${existingBookmarks.length} existing bookmarks for updates...`);
         const updateResult = checkAndUpdateBookmarks(existingBookmarks, idToPageMap, startTime);
         totalUpdated += updateResult.updated;
-        
+
         // If we're out of time during updates, stop processing
         if (updateResult.outOfTime) {
           Logger.log(`⚠️ Approaching execution time limit during updates. Processed ${totalProcessed} bookmarks.`);
           Logger.log('Script will resume on next trigger.');
-          hasMore = false;
           break;
         }
       } else if (existingBookmarks.length > 0 && !CONFIG.ENABLE_UPDATE_CHECK) {
         Logger.log(`Update check is disabled, skipping ${existingBookmarks.length} existing bookmarks`);
       }
-      
-      if (newBookmarks.length > 0) {
-        // Separate Twitter and non-Twitter bookmarks
-        // Only treat as Twitter bookmark if it's in the "Twitter" collection AND Twitter organization is enabled
-        // Articles from Twitter should be treated as regular bookmarks
-        const twitterBookmarks = [];
-        const regularBookmarks = [];
-        
-        for (const bookmark of newBookmarks) {
-          // Only use Twitter processing if:
-          // 1. Twitter organization is enabled
-          // 2. URL is from Twitter
-          // 3. Collection is "Twitter" or "Unsorted"
-          if (CONFIG.ENABLE_TWITTER_ORGANIZATION &&
-              isTwitterUrl(bookmark.link) && 
-              (bookmark.collectionName === 'Twitter' || bookmark.collectionName === 'Unsorted')) {
-            twitterBookmarks.push(bookmark);
-          } else {
-            regularBookmarks.push(bookmark);
-          }
-        }
-        
-        // Process Twitter bookmarks (with parent pages)
-        if (twitterBookmarks.length > 0) {
-          Logger.log(`Processing ${twitterBookmarks.length} Twitter bookmarks...`);
-          const created = processTwitterBookmarks(twitterBookmarks, twitterParents, existingIds);
-          totalCreated += created;
-        }
-        
-        // Process regular bookmarks in batches
-        if (regularBookmarks.length > 0) {
-          Logger.log(`Processing ${regularBookmarks.length} regular bookmarks...`);
-          const created = processBatchBookmarks(regularBookmarks, null, existingIds);
-          totalCreated += created;
-        }
+
+      // Articles from Twitter stay regular bookmarks; only Twitter/Unsorted collections get parent pages
+      const twitterBookmarks = newBookmarks.filter(isOrganizedTwitterBookmark);
+      const regularBookmarks = newBookmarks.filter(b => !isOrganizedTwitterBookmark(b));
+
+      if (twitterBookmarks.length > 0) {
+        Logger.log(`Processing ${twitterBookmarks.length} Twitter bookmarks...`);
+        totalCreated += processTwitterBookmarks(twitterBookmarks, twitterParents, existingIds);
       }
-      
+
+      if (regularBookmarks.length > 0) {
+        Logger.log(`Processing ${regularBookmarks.length} regular bookmarks...`);
+        totalCreated += processBatchBookmarks(regularBookmarks, existingIds);
+      }
+
       totalProcessed += bookmarks.length;
-      
-      // Check if there are more pages
-      hasMore = response.items.length >= CONFIG.RAINDROP_PAGE_SIZE;
-      page++;
-      
-      // Delay between pages to avoid rate limits
-      if (hasMore) {
-        Utilities.sleep(CONFIG.DELAY_BETWEEN_BATCHES);
-      }
     }
-    
+
     // Final summary
     const endTime = new Date().getTime();
     const duration = ((endTime - startTime) / 1000).toFixed(2);
@@ -340,7 +531,6 @@ function syncRaindropToNotion() {
   }
 }
 
-
 function createDailyTrigger() {
   // First, check if trigger already exists
   const triggers = ScriptApp.getProjectTriggers();
@@ -367,8 +557,6 @@ function createDailyTrigger() {
 }
 
 // ============================================================================
-
-// ============================================================================
 // RAINDROP.IO API FUNCTIONS
 // ============================================================================
 
@@ -378,32 +566,7 @@ function createDailyTrigger() {
  * @returns {Object} Response with items array
  */
 function fetchRaindropBookmarks(page = 0) {
-  const url = `${CONFIG.RAINDROP_API_BASE}/raindrops/0?perpage=${CONFIG.RAINDROP_PAGE_SIZE}&page=${page}&sort=-created`;
-  
-  const options = {
-    method: 'get',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.RAINDROP_API_TOKEN}`
-    },
-    muteHttpExceptions: true
-  };
-  
-  return makeRequestWithRetry(() => {
-    const response = UrlFetchApp.fetch(url, options);
-    const code = response.getResponseCode();
-    
-    if (code === 429) {
-      Logger.log('⚠️ Rate limited by Raindrop API, waiting...');
-      Utilities.sleep(CONFIG.DELAY_ON_RATE_LIMIT);
-      throw new Error('Rate limited');
-    }
-    
-    if (code !== 200) {
-      throw new Error(`Raindrop API error: ${code} - ${response.getContentText()}`);
-    }
-    
-    return JSON.parse(response.getContentText());
-  });
+  return raindropRequest(`/raindrops/0?perpage=${CONFIG.RAINDROP_PAGE_SIZE}&page=${page}&sort=-created`);
 }
 
 /**
@@ -415,28 +578,33 @@ function fetchRaindropCollection(collectionId) {
   if (!collectionId || collectionId === 0) {
     return { title: 'Unsorted' };
   }
-  
-  const url = `${CONFIG.RAINDROP_API_BASE}/collection/${collectionId}`;
-  
-  const options = {
-    method: 'get',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.RAINDROP_API_TOKEN}`
-    },
-    muteHttpExceptions: true
-  };
-  
-  return makeRequestWithRetry(() => {
-    const response = UrlFetchApp.fetch(url, options);
-    const code = response.getResponseCode();
-    
-    if (code === 200) {
-      const data = JSON.parse(response.getContentText());
-      return data.item;
+
+  try {
+    return raindropRequest(`/collection/${collectionId}`).item;
+  } catch (error) {
+    if (error.status && error.status !== 429) {
+      return { title: 'Unknown Collection' };
     }
-    
-    return { title: 'Unknown Collection' };
-  });
+    throw error;
+  }
+}
+
+/**
+ * Get all current Raindrop bookmark IDs
+ * @returns {Set} Set of all current Raindrop IDs
+ */
+function getAllRaindropIds() {
+  const raindropIds = new Set();
+
+  for (const { items } of raindropPages(300)) {
+    items.forEach(bookmark => {
+      if (bookmark._id) {
+        raindropIds.add(bookmark._id.toString());
+      }
+    });
+  }
+
+  return raindropIds;
 }
 
 // ============================================================================
@@ -445,171 +613,50 @@ function fetchRaindropCollection(collectionId) {
 
 /**
  * Query Notion database to get existing Raindrop IDs with their Notion page IDs
- * Also checks Twitter parent pages for child pages containing Raindrop IDs
+ * Also checks Twitter parent pages for tweets containing Raindrop IDs
  * @returns {Object} Object with two properties:
  *   - idSet: Set of existing Raindrop IDs
  *   - idToPageMap: Map of Raindrop ID -> {notionPageId, lastEditedTime, isTwitterChild}
  */
 function getExistingRaindropIds() {
   const existingIds = new Set();
-  const idToPageMap = new Map(); // Map Raindrop ID to Notion page info
-  let hasMore = true;
-  let startCursor = undefined;
-  let retryCount = 0;
-  const maxRetries = 3;
-  
-  // First, get IDs from database items
-  while (hasMore) {
-    const url = `${CONFIG.NOTION_API_BASE}/databases/${CONFIG.NOTION_DATABASE_ID}/query`;
-    
-    const payload = {
-      page_size: 100
-    };
-    
-    if (startCursor) {
-      payload.start_cursor = startCursor;
-    }
-    
-    const options = {
-      method: 'post',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION,
-        'Content-Type': 'application/json'
-      },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    };
-    
-    try {
-      const response = UrlFetchApp.fetch(url, options);
-      const responseCode = response.getResponseCode();
-      
-      // Handle transient errors with retry
-      if (responseCode !== 200 && retryCount < maxRetries) {
-        retryCount++;
-        Logger.log(`⚠️ Error fetching existing IDs (${responseCode}), retry ${retryCount}/${maxRetries} in 3 seconds...`);
-        Utilities.sleep(3000);
-        continue; // Retry the same request
-      }
-      
-      if (responseCode !== 200) {
-        throw new Error(`Failed after ${maxRetries} retries: ${response.getContentText()}`);
-      }
-      
-      // Reset retry count on success
-      retryCount = 0;
-      
-      const data = JSON.parse(response.getContentText());
-      
-      if (data.results) {
-        data.results.forEach(page => {
-          // Get Raindrop IDs from database items
-          if (page.properties && page.properties['Raindrop ID']) {
-            const raindropId = page.properties['Raindrop ID'].rich_text?.[0]?.plain_text;
-            if (raindropId) {
-              existingIds.add(raindropId);
-              idToPageMap.set(raindropId, {
-                notionPageId: page.id,
-                lastEditedTime: page.last_edited_time,
-                isTwitterChild: false
-              });
-            }
-          }
-          
-          // Check if this is a Twitter parent page, and scan its children
-          if (page.properties && page.properties['Type'] && 
-              page.properties['Type'].select?.name === 'tweets') {
-            try {
-              const childInfo = getTwitterChildrenRaindropIds(page.id);
-              childInfo.forEach(info => {
-                existingIds.add(info.raindropId);
-                idToPageMap.set(info.raindropId, {
-                  notionPageId: page.id, // Store parent page ID for Twitter children
-                  lastEditedTime: page.last_edited_time,
-                  isTwitterChild: true,
-                  blockIds: info.blockIds
-                });
-              });
-            } catch (error) {
-              Logger.log(`Warning: Error checking children of ${page.id}: ${error.message}`);
-            }
-          }
+  const idToPageMap = new Map();
+
+  try {
+    for (const page of queryDatabase()) {
+      const raindropId = page.properties?.['Raindrop ID']?.rich_text?.[0]?.plain_text;
+      if (raindropId) {
+        existingIds.add(raindropId);
+        idToPageMap.set(raindropId, {
+          notionPageId: page.id,
+          lastEditedTime: page.last_edited_time,
+          isTwitterChild: false
         });
       }
-      
-      hasMore = data.has_more;
-      startCursor = data.next_cursor;
-      
-    } catch (error) {
-      // Critical error - we need existing IDs to avoid duplicates
-      if (retryCount < maxRetries) {
-        retryCount++;
-        Logger.log(`❌ Error fetching existing IDs: ${error.message}`);
-        Logger.log(`⚠️ Retrying (${retryCount}/${maxRetries}) in 5 seconds...`);
-        Utilities.sleep(5000);
-        continue; // Retry
-      } else {
-        Logger.log(`❌ CRITICAL: Failed to fetch existing IDs after ${maxRetries} retries`);
-        Logger.log(`❌ This would create massive duplicates - ABORTING IMMEDIATELY`);
-        // Don't return empty set - throw error to prevent duplicate creation
-        throw new Error(`DUPLICATE PREVENTION: Cannot proceed without existing IDs: ${error.message}`);
+
+      if (page.properties?.['Type']?.select?.name === 'tweets') {
+        try {
+          getTwitterChildBlocksWithRaindropIds(page.id).forEach(info => {
+            existingIds.add(info.raindropId);
+            idToPageMap.set(info.raindropId, {
+              notionPageId: page.id,
+              lastEditedTime: page.last_edited_time,
+              isTwitterChild: true,
+              blockIds: info.blockIds
+            });
+          });
+        } catch (error) {
+          Logger.log(`Warning: Error checking children of ${page.id}: ${error.message}`);
+        }
       }
     }
-    
-    if (hasMore) {
-      Utilities.sleep(300); // Small delay between pagination requests
-    }
+  } catch (error) {
+    Logger.log(`❌ CRITICAL: Failed to fetch existing IDs: ${error.message}`);
+    Logger.log('❌ This would create massive duplicates - ABORTING IMMEDIATELY');
+    throw new Error(`DUPLICATE PREVENTION: Cannot proceed without existing IDs: ${error.message}`);
   }
-  
+
   return { idSet: existingIds, idToPageMap: idToPageMap };
-}
-
-/**
- * Get Raindrop IDs from child pages of a Twitter parent page
- * Now searches content blocks within the parent page for embedded Raindrop IDs
- * Returns the IDs with block information
- * @param {string} parentPageId - ID of the Twitter parent page
- * @returns {Array} Array of objects with {raindropId, blockIds: [array of block IDs]}
- */
-function getTwitterChildrenRaindropIds(parentPageId) {
-  return getTwitterChildBlocksWithRaindropIds(parentPageId);
-}
-
-/**
- * Get the text content of a page
- * @param {string} pageId - ID of the page
- * @returns {string} Text content of the page
- */
-function getPageContent(pageId) {
-  const url = `${CONFIG.NOTION_API_BASE}/blocks/${pageId}/children`;
-  
-  const options = {
-    method: 'get',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-      'Notion-Version': CONFIG.NOTION_API_VERSION
-    },
-    muteHttpExceptions: true
-  };
-  
-  const response = UrlFetchApp.fetch(url, options);
-  const data = JSON.parse(response.getContentText());
-  
-  let content = '';
-  if (data.results) {
-    data.results.forEach(block => {
-      if (block.type === 'paragraph' && block.paragraph && block.paragraph.rich_text) {
-        block.paragraph.rich_text.forEach(text => {
-          if (text.plain_text) {
-            content += text.plain_text + ' ';
-          }
-        });
-      }
-    });
-  }
-  
-  return content;
 }
 
 /**
@@ -685,107 +732,47 @@ function deleteRemovedBookmarks() {
  */
 function deleteRemovedTweetsFromParents(currentRaindropIds) {
   Logger.log('\n=== Checking for deleted tweets in Twitter parent pages ===');
-  
+
   try {
-    // Find all Twitter parent pages
-    const url = `${CONFIG.NOTION_API_BASE}/databases/${CONFIG.NOTION_DATABASE_ID}/query`;
     const titleProp = getDatabaseTitlePropertyName();
-    const payload = {
-      filter: {
-        property: 'Type',
-        select: { equals: 'tweets' }
-      },
-      page_size: 100
-    };
-    
-    const options = {
-      method: 'post',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION,
-        'Content-Type': 'application/json'
-      },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    };
-    
-    let hasMore = true;
-    let startCursor = undefined;
     let totalDeletedTweets = 0;
     let totalDeletedBlocks = 0;
-    const emptyParents = []; // Track parents that become empty
-    
-    while (hasMore) {
-      if (startCursor) {
-        payload.start_cursor = startCursor;
-      }
-      
-      const response = UrlFetchApp.fetch(url, {
-        ...options,
-        payload: JSON.stringify(payload)
-      });
-      
-      const data = JSON.parse(response.getContentText());
-      
-      if (data.results) {
-        for (const page of data.results) {
-          const parentTitle = page.properties[titleProp]?.title?.[0]?.plain_text || 'Unknown';
-          const tweets = getTwitterChildBlocksWithRaindropIds(page.id);
-          
-          // Find tweets to delete
-          const tweetsToDelete = tweets.filter(tweet => 
-            !currentRaindropIds.has(tweet.raindropId)
-          );
-          
-          if (tweetsToDelete.length > 0) {
-            Logger.log(`Found ${tweetsToDelete.length} deleted tweet(s) in ${parentTitle}`);
-            
-            for (const tweet of tweetsToDelete) {
-              try {
-                // Delete all blocks associated with this tweet
-                for (const blockId of tweet.blockIds) {
-                  try {
-                    deleteNotionBlock(blockId);
-                    totalDeletedBlocks++;
-                    Utilities.sleep(150);
-                  } catch (error) {
-                    Logger.log(`  ⚠️ Failed to delete block ${blockId}: ${error.message}`);
-                  }
-                }
-                totalDeletedTweets++;
-                Logger.log(`  ✓ Deleted tweet with ${tweet.blockIds.length} blocks (Raindrop ID: ${tweet.raindropId})`);
-              } catch (error) {
-                Logger.log(`  ❌ Failed to delete tweet ${tweet.raindropId}: ${error.message}`);
-              }
-            }
-            
-            // Check if all tweets were deleted from this parent
-            if (tweetsToDelete.length === tweets.length) {
-              emptyParents.push({
-                id: page.id,
-                title: parentTitle
-              });
-            }
+    const emptyParents = [];
+
+    for (const page of queryDatabase({ property: 'Type', select: { equals: 'tweets' } })) {
+      const parentTitle = page.properties[titleProp]?.title?.[0]?.plain_text || 'Unknown';
+      const tweets = getTwitterChildBlocksWithRaindropIds(page.id);
+      const tweetsToDelete = tweets.filter(tweet => !currentRaindropIds.has(tweet.raindropId));
+
+      if (tweetsToDelete.length === 0) continue;
+
+      Logger.log(`Found ${tweetsToDelete.length} deleted tweet(s) in ${parentTitle}`);
+
+      for (const tweet of tweetsToDelete) {
+        for (const blockId of tweet.blockIds) {
+          try {
+            deleteNotionBlock(blockId);
+            totalDeletedBlocks++;
+            Utilities.sleep(150);
+          } catch (error) {
+            Logger.log(`  ⚠️ Failed to delete block ${blockId}: ${error.message}`);
           }
         }
+        totalDeletedTweets++;
+        Logger.log(`  ✓ Deleted tweet with ${tweet.blockIds.length} blocks (Raindrop ID: ${tweet.raindropId})`);
       }
-      
-      hasMore = data.has_more;
-      startCursor = data.next_cursor;
-      
-      if (hasMore) {
-        Utilities.sleep(300);
+
+      if (tweetsToDelete.length === tweets.length) {
+        emptyParents.push({ id: page.id, title: parentTitle });
       }
     }
-    
-    // Report results
+
     if (totalDeletedTweets > 0) {
       Logger.log(`\n✓ Deleted ${totalDeletedTweets} tweet(s) (${totalDeletedBlocks} blocks) from parent pages`);
     } else {
       Logger.log('✓ No deleted tweets found in parent pages');
     }
-    
-    // Delete empty parent pages
+
     if (emptyParents.length > 0) {
       Logger.log(`\n=== Deleting ${emptyParents.length} empty Twitter parent page(s) ===`);
       for (const parent of emptyParents) {
@@ -798,7 +785,7 @@ function deleteRemovedTweetsFromParents(currentRaindropIds) {
         }
       }
     }
-    
+
   } catch (error) {
     Logger.log(`❌ Error in deleteRemovedTweetsFromParents: ${error.message}`);
     Logger.log(error.stack);
@@ -806,247 +793,131 @@ function deleteRemovedTweetsFromParents(currentRaindropIds) {
 }
 
 /**
- * Get all current Raindrop bookmark IDs
- * @returns {Set} Set of all current Raindrop IDs
- */
-function getAllRaindropIds() {
-  const raindropIds = new Set();
-  let page = 0;
-  let hasMore = true;
-
-  while (hasMore) {
-    const response = fetchRaindropBookmarks(page);
-
-    if (!response || !Array.isArray(response.items)) {
-      throw new Error(`Unexpected Raindrop response on page ${page}`);
-    }
-
-    response.items.forEach(bookmark => {
-      if (bookmark._id) {
-        raindropIds.add(bookmark._id.toString());
-      }
-    });
-
-    hasMore = response.items.length >= CONFIG.RAINDROP_PAGE_SIZE;
-    page++;
-
-    if (hasMore) {
-      Utilities.sleep(300);
-    }
-  }
-
-  return raindropIds;
-}
-
-/**
  * Get all Notion pages with their Raindrop IDs
- * @returns {Array} Array of objects with {notionPageId, raindropId, title}
+ * A failed fetch returns the pages read so far, which can only reduce deletions
+ * @returns {Array} Array of objects with {notionPageId, raindropId, title, type}
  */
 function getAllNotionPagesWithRaindropIds() {
-  const pages = [];
-  let hasMore = true;
-  let startCursor = undefined;
   const titleProp = getDatabaseTitlePropertyName();
-  
-  while (hasMore) {
-    const url = `${CONFIG.NOTION_API_BASE}/databases/${CONFIG.NOTION_DATABASE_ID}/query`;
-    
-    const payload = {
-      page_size: 100
-    };
-    
-    if (startCursor) {
-      payload.start_cursor = startCursor;
+  const pages = [];
+
+  try {
+    for (const page of queryDatabase()) {
+      const raindropId = page.properties?.['Raindrop ID']?.rich_text?.[0]?.plain_text;
+      if (!raindropId) continue;
+
+      pages.push({
+        notionPageId: page.id,
+        raindropId: raindropId,
+        title: page.properties[titleProp]?.title?.[0]?.plain_text || 'Untitled',
+        type: page.properties['Type']?.select?.name
+      });
     }
+  } catch (error) {
+    Logger.log(`❌ Error fetching Notion pages: ${error.message}`);
+  }
+
+  return pages;
+}
+
+const TWEET_ID_PATTERN = new RegExp(`${TWEET_ID_LABEL} (\\w+)`);
+
+/**
+ * Group the blocks of a Twitter parent page into tweets
+ * Tweet structure: [content blocks...] [metadata with ID] [link] [3 empty lines]
+ * @param {Array} allBlocks - All child blocks of the parent page, in order
+ * @returns {Array} Array of objects with {raindropId, blockIds: [array of block IDs to delete]}
+ */
+function groupTweetBlocks(allBlocks) {
+  const tweets = [];
+
+  // Find blocks with Raindrop IDs and collect all related blocks for each tweet
+  for (let i = 0; i < allBlocks.length; i++) {
+    const block = allBlocks[i];
     
-    const options = {
-      method: 'post',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION,
-        'Content-Type': 'application/json'
-      },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    };
-    
-    try {
-      const response = UrlFetchApp.fetch(url, options);
-      const responseCode = response.getResponseCode();
+    // Check if this block contains a Raindrop ID
+    if (block.type === 'paragraph' && block.paragraph && block.paragraph.rich_text) {
+      const text = block.paragraph.rich_text.map(t => t.plain_text).join('');
+      const raindropIdMatch = text.match(TWEET_ID_PATTERN);
       
-      if (responseCode !== 200) {
-        throw new Error(`Failed to fetch Notion pages: ${response.getContentText()}`);
-      }
-      
-      const data = JSON.parse(response.getContentText());
-      
-      if (data.results) {
-        data.results.forEach(page => {
-          // Get Raindrop ID from page properties
-          if (page.properties && page.properties['Raindrop ID']) {
-            const raindropId = page.properties['Raindrop ID'].rich_text?.[0]?.plain_text;
-            if (raindropId) {
-              const title = page.properties[titleProp]?.title?.[0]?.plain_text || 'Untitled';
-              pages.push({
-                notionPageId: page.id,
-                raindropId: raindropId,
-                title: title,
-                type: page.properties['Type']?.select?.name
-              });
-            }
+      if (raindropIdMatch && raindropIdMatch[1]) {
+        const raindropId = raindropIdMatch[1];
+        const blockIds = [];
+        
+        // Collect all blocks for this tweet
+        // Tweet structure: [content blocks...] [metadata with ID] [link] [3 empty lines]
+        
+        // Add the metadata block (current block)
+        blockIds.push(block.id);
+        
+        // Look for the link block (next block after metadata)
+        if (i + 1 < allBlocks.length) {
+          blockIds.push(allBlocks[i + 1].id);
+        }
+        
+        // Look for empty line blocks after the link (up to 3)
+        let emptyCount = 0;
+        for (let j = i + 2; j < allBlocks.length && emptyCount < 3; j++) {
+          const nextBlock = allBlocks[j];
+          if (nextBlock.type === 'paragraph' && 
+              nextBlock.paragraph.rich_text.length === 0) {
+            blockIds.push(nextBlock.id);
+            emptyCount++;
+          } else {
+            break; // Stop if we hit a non-empty block
           }
+        }
+        
+        // Look backwards for content blocks (before metadata)
+        // Content could be multiple paragraphs
+        for (let j = i - 1; j >= 0; j--) {
+          const prevBlock = allBlocks[j];
           
-          // Note: Twitter parent pages and their tweet blocks are handled separately
-          // in deleteRemovedTweetsFromParents() function
+          // Stop if we hit another tweet's metadata or empty spacing
+          if (prevBlock.type === 'paragraph' && prevBlock.paragraph.rich_text.length > 0) {
+            const prevText = prevBlock.paragraph.rich_text.map(t => t.plain_text).join('');
+            
+            // Check if this is another tweet's metadata or link
+            if (prevText.includes(TWEET_ID_LABEL) || 
+                prevText.includes('twitter.com') || 
+                prevText.includes('x.com')) {
+              break;
+            }
+            
+            // This is content, add it
+            blockIds.unshift(prevBlock.id); // Add to beginning
+          } else if (prevBlock.type === 'quote') {
+            blockIds.unshift(prevBlock.id); // Notes are stored as quote blocks
+          } else if (prevBlock.type === 'paragraph' && prevBlock.paragraph.rich_text.length === 0) {
+            // Empty line - could be spacing from previous tweet, stop here
+            break;
+          } else {
+            break;
+          }
+        }
+        
+        tweets.push({
+          raindropId: raindropId,
+          blockIds: blockIds
         });
       }
-      
-      hasMore = data.has_more;
-      startCursor = data.next_cursor;
-      
-    } catch (error) {
-      Logger.log(`❌ Error fetching Notion pages: ${error.message}`);
-      break;
-    }
-    
-    if (hasMore) {
-      Utilities.sleep(300);
     }
   }
-  
-  return pages;
+
+  return tweets;
 }
 
 /**
  * Get Twitter child blocks with their Raindrop IDs from a parent page
- * Returns blocks grouped by tweet with all related blocks (content, metadata, link, spacing)
  * @param {string} parentPageId - ID of the Twitter parent page
- * @returns {Array} Array of objects with {raindropId, blockIds: [array of block IDs to delete]}
+ * @returns {Array} Array of objects with {raindropId, blockIds}
  */
 function getTwitterChildBlocksWithRaindropIds(parentPageId) {
-  const tweets = [];
-  let hasMore = true;
-  let startCursor = undefined;
-  
-  while (hasMore) {
-    const url = `${CONFIG.NOTION_API_BASE}/blocks/${parentPageId}/children`;
-    const fullUrl = startCursor ? `${url}?start_cursor=${startCursor}&page_size=100` : `${url}?page_size=100`;
-    
-    const options = {
-      method: 'get',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION
-      },
-      muteHttpExceptions: true
-    };
-    
-    try {
-      const data = makeRequestWithRetry(() => {
-        const response = UrlFetchApp.fetch(fullUrl, options);
-        const code = response.getResponseCode();
-
-        if (code === 429) {
-          Logger.log('⚠️ Rate limited by Notion API, waiting...');
-          Utilities.sleep(CONFIG.DELAY_ON_RATE_LIMIT);
-          throw new Error('Rate limited');
-        }
-
-        if (code !== 200) {
-          throw new Error(`Notion API error: ${code} - ${response.getContentText()}`);
-        }
-
-        return JSON.parse(response.getContentText());
-      });
-      
-      if (data.results) {
-        const allBlocks = data.results;
-        
-        // Find blocks with Raindrop IDs and collect all related blocks for each tweet
-        for (let i = 0; i < allBlocks.length; i++) {
-          const block = allBlocks[i];
-          
-          // Check if this block contains a Raindrop ID
-          if (block.type === 'paragraph' && block.paragraph && block.paragraph.rich_text) {
-            const text = block.paragraph.rich_text.map(t => t.plain_text).join('');
-            const raindropIdMatch = text.match(/🆔 Raindrop ID: (\w+)/);
-            
-            if (raindropIdMatch && raindropIdMatch[1]) {
-              const raindropId = raindropIdMatch[1];
-              const blockIds = [];
-              
-              // Collect all blocks for this tweet
-              // Tweet structure: [content blocks...] [metadata with ID] [link] [3 empty lines]
-              
-              // Add the metadata block (current block)
-              blockIds.push(block.id);
-              
-              // Look for the link block (next block after metadata)
-              if (i + 1 < allBlocks.length) {
-                blockIds.push(allBlocks[i + 1].id);
-              }
-              
-              // Look for empty line blocks after the link (up to 3)
-              let emptyCount = 0;
-              for (let j = i + 2; j < allBlocks.length && emptyCount < 3; j++) {
-                const nextBlock = allBlocks[j];
-                if (nextBlock.type === 'paragraph' && 
-                    nextBlock.paragraph.rich_text.length === 0) {
-                  blockIds.push(nextBlock.id);
-                  emptyCount++;
-                } else {
-                  break; // Stop if we hit a non-empty block
-                }
-              }
-              
-              // Look backwards for content blocks (before metadata)
-              // Content could be multiple paragraphs
-              for (let j = i - 1; j >= 0; j--) {
-                const prevBlock = allBlocks[j];
-                
-                // Stop if we hit another tweet's metadata or empty spacing
-                if (prevBlock.type === 'paragraph' && prevBlock.paragraph.rich_text.length > 0) {
-                  const prevText = prevBlock.paragraph.rich_text.map(t => t.plain_text).join('');
-                  
-                  // Check if this is another tweet's metadata or link
-                  if (prevText.includes('🆔 Raindrop ID:') || 
-                      prevText.includes('twitter.com') || 
-                      prevText.includes('x.com')) {
-                    break;
-                  }
-                  
-                  // This is content, add it
-                  blockIds.unshift(prevBlock.id); // Add to beginning
-                } else if (prevBlock.type === 'paragraph' && prevBlock.paragraph.rich_text.length === 0) {
-                  // Empty line - could be spacing from previous tweet, stop here
-                  break;
-                } else {
-                  break;
-                }
-              }
-              
-              tweets.push({
-                raindropId: raindropId,
-                blockIds: blockIds
-              });
-            }
-          }
-        }
-      }
-      
-      hasMore = data.has_more;
-      startCursor = data.next_cursor;
-      
-    } catch (error) {
-      throw new Error(`Failed to read blocks of ${parentPageId}: ${error.message}`);
-    }
-    
-    if (hasMore) {
-      Utilities.sleep(200);
-    }
+  try {
+    return groupTweetBlocks(Array.from(listBlockChildren(parentPageId)));
+  } catch (error) {
+    throw new Error(`Failed to read blocks of ${parentPageId}: ${error.message}`);
   }
-  
-  return tweets;
 }
 
 /**
@@ -1054,39 +925,7 @@ function getTwitterChildBlocksWithRaindropIds(parentPageId) {
  * @param {string} pageId - ID of the page to delete
  */
 function deleteNotionPage(pageId) {
-  const url = `${CONFIG.NOTION_API_BASE}/pages/${pageId}`;
-  
-  const payload = {
-    archived: true
-  };
-  
-  const options = {
-    method: 'patch',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-      'Notion-Version': CONFIG.NOTION_API_VERSION,
-      'Content-Type': 'application/json'
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-  
-  return makeRequestWithRetry(() => {
-    const response = UrlFetchApp.fetch(url, options);
-    const code = response.getResponseCode();
-    
-    if (code === 429) {
-      Logger.log('⚠️ Rate limited by Notion API, waiting...');
-      Utilities.sleep(CONFIG.DELAY_ON_RATE_LIMIT);
-      throw new Error('Rate limited');
-    }
-    
-    if (code !== 200) {
-      throw new Error(`Notion API error: ${code} - ${response.getContentText()}`);
-    }
-    
-    return JSON.parse(response.getContentText());
-  });
+  return notionRequest('patch', `/pages/${pageId}`, { archived: true });
 }
 
 /**
@@ -1094,33 +933,7 @@ function deleteNotionPage(pageId) {
  * @param {string} blockId - ID of the block to delete
  */
 function deleteNotionBlock(blockId) {
-  const url = `${CONFIG.NOTION_API_BASE}/blocks/${blockId}`;
-  
-  const options = {
-    method: 'delete',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-      'Notion-Version': CONFIG.NOTION_API_VERSION
-    },
-    muteHttpExceptions: true
-  };
-  
-  return makeRequestWithRetry(() => {
-    const response = UrlFetchApp.fetch(url, options);
-    const code = response.getResponseCode();
-    
-    if (code === 429) {
-      Logger.log('⚠️ Rate limited by Notion API, waiting...');
-      Utilities.sleep(CONFIG.DELAY_ON_RATE_LIMIT);
-      throw new Error('Rate limited');
-    }
-    
-    if (code !== 200) {
-      throw new Error(`Notion API error: ${code} - ${response.getContentText()}`);
-    }
-    
-    return JSON.parse(response.getContentText());
-  });
+  return notionRequest('delete', `/blocks/${blockId}`);
 }
 
 /**
@@ -1130,103 +943,14 @@ function deleteNotionBlock(blockId) {
  * @returns {Object} Updated page response
  */
 function updateNotionPage(pageId, bookmark) {
-  const url = `${CONFIG.NOTION_API_BASE}/pages/${pageId}`;
-  
-  const titleProp = getDatabaseTitlePropertyName();
-  const properties = {
-    [titleProp]: {
-      title: [
-        {
-          text: {
-            content: pageTitle(bookmark)
-          }
-        }
-      ]
-    },
-    'Type': {
-      select: {
-        name: bookmark.type || 'link'
-      }
-    },
-    'Collection': {
-      select: {
-        name: bookmark.collectionName || 'Unsorted'
-      }
-    }
-  };
-  
-  // Add tags if present
-  if (bookmark.tags && bookmark.tags.length > 0) {
-    properties['Tags'] = {
-      multi_select: bookmark.tags.map(tag => ({ name: tag }))
-    };
-  } else {
-    // Clear tags if none present
-    properties['Tags'] = {
-      multi_select: []
-    };
-  }
-  
   const payload = {
-    properties: properties
+    properties: bookmarkProperties(bookmark, getDatabaseTitlePropertyName()),
+    ...coverAndIcon(bookmark)
   };
-  
-  // Add cover image if present and enabled
-  if (CONFIG.ENABLE_COVERS && bookmark.cover) {
-    // Handle both string URLs and object formats
-    const coverUrl = typeof bookmark.cover === 'string' ? bookmark.cover : bookmark.cover?.url;
-    if (coverUrl) {
-      payload.cover = {
-        type: 'external',
-        external: {
-          url: coverUrl
-        }
-      };
-    }
-  }
-  
-  // Add icon if enabled (separate from cover)
-  if (CONFIG.ENABLE_ICONS && bookmark.cover) {
-    const coverUrl = typeof bookmark.cover === 'string' ? bookmark.cover : bookmark.cover?.url;
-    if (coverUrl) {
-      payload.icon = {
-        type: 'external',
-        external: {
-          url: coverUrl
-        }
-      };
-    }
-  }
-  
-  const options = {
-    method: 'patch',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-      'Notion-Version': CONFIG.NOTION_API_VERSION,
-      'Content-Type': 'application/json'
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-  
-  const result = makeRequestWithRetry(() => {
-    const response = UrlFetchApp.fetch(url, options);
-    const code = response.getResponseCode();
-    
-    if (code === 429) {
-      Logger.log('⚠️ Rate limited by Notion API, waiting...');
-      Utilities.sleep(CONFIG.DELAY_ON_RATE_LIMIT);
-      throw new Error('Rate limited');
-    }
-    
-    if (code !== 200) {
-      throw new Error(`Notion API error: ${code} - ${response.getContentText()}`);
-    }
-    
-    return JSON.parse(response.getContentText());
-  });
-  
-  // Update page content (note/excerpt) if enabled - always call to handle deletions
+
+  const result = notionRequest('patch', `/pages/${pageId}`, payload);
+
+  // Always call to handle deletions
   if (CONFIG.ENABLE_PAGE_CONTENT) {
     try {
       updatePageContentWithExcerptAndNote(pageId, bookmark);
@@ -1234,134 +958,34 @@ function updateNotionPage(pageId, bookmark) {
       Logger.log(`  ⚠️ Failed to update page content: ${error.message}`);
     }
   }
-  
+
   return result;
 }
 
 /**
- * Update page content with both excerpt and note (matching create behavior)
+ * Replace page content with the bookmark's excerpt and note (matching create behavior)
  * @param {string} pageId - Notion page ID
  * @param {Object} bookmark - Bookmark object with excerpt and/or note
  */
 function updatePageContentWithExcerptAndNote(pageId, bookmark) {
   try {
-    // First, get existing blocks
-    const blocksUrl = `${CONFIG.NOTION_API_BASE}/blocks/${pageId}/children`;
-    const getOptions = {
-      method: 'get',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION
-      },
-      muteHttpExceptions: true
-    };
-    
-    const getResponse = UrlFetchApp.fetch(blocksUrl, getOptions);
-    const existingBlocks = JSON.parse(getResponse.getContentText());
-    
-    // Delete existing content blocks (paragraphs and quotes)
-    if (existingBlocks.results) {
-      for (const block of existingBlocks.results) {
-        if (block.type === 'paragraph' || block.type === 'quote') {
-          try {
-            deleteNotionBlock(block.id);
-            Utilities.sleep(100);
-          } catch (error) {
-            Logger.log(`Warning: Could not delete block ${block.id}: ${error.message}`);
-          }
+    const existingBlocks = Array.from(listBlockChildren(pageId));
+
+    for (const existing of existingBlocks) {
+      if (existing.type === 'paragraph' || existing.type === 'quote') {
+        try {
+          deleteNotionBlock(existing.id);
+          Utilities.sleep(100);
+        } catch (error) {
+          Logger.log(`Warning: Could not delete block ${existing.id}: ${error.message}`);
         }
       }
     }
-    
-    const newBlocks = bookmarkContentBlocks(bookmark).slice(0, CONFIG.MAX_BLOCKS_PER_REQUEST);
 
-    // Add new content blocks
+    const newBlocks = bookmarkContentBlocks(bookmark);
     if (newBlocks.length > 0) {
-      const addOptions = {
-        method: 'patch',
-        headers: {
-          'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-          'Notion-Version': CONFIG.NOTION_API_VERSION,
-          'Content-Type': 'application/json'
-        },
-        payload: JSON.stringify({ children: newBlocks }),
-        muteHttpExceptions: true
-      };
-      
-      UrlFetchApp.fetch(blocksUrl, addOptions);
+      notionRequest('patch', `/blocks/${pageId}/children`, { children: newBlocks }, { idempotent: false });
     }
-  } catch (error) {
-    Logger.log(`Warning: Could not update page content: ${error.message}`);
-  }
-}
-
-/**
- * Update the content (note/excerpt) of a Notion page
- * @param {string} pageId - Notion page ID
- * @param {string} content - New content to set
- */
-function updateNotionPageContent(pageId, content) {
-  if (!content) return;
-  
-  try {
-    // First, get existing blocks
-    const blocksUrl = `${CONFIG.NOTION_API_BASE}/blocks/${pageId}/children`;
-    const getOptions = {
-      method: 'get',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION
-      },
-      muteHttpExceptions: true
-    };
-    
-    const getResponse = UrlFetchApp.fetch(blocksUrl, getOptions);
-    const existingBlocks = JSON.parse(getResponse.getContentText());
-    
-    // Delete existing content blocks (paragraphs)
-    if (existingBlocks.results) {
-      for (const block of existingBlocks.results) {
-        if (block.type === 'paragraph') {
-          try {
-            deleteNotionBlock(block.id);
-            Utilities.sleep(100);
-          } catch (error) {
-            Logger.log(`Warning: Could not delete block ${block.id}: ${error.message}`);
-          }
-        }
-      }
-    }
-    
-    // Add new content
-    const addOptions = {
-      method: 'patch',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION,
-        'Content-Type': 'application/json'
-      },
-      payload: JSON.stringify({
-        children: [
-          {
-            object: 'block',
-            type: 'paragraph',
-            paragraph: {
-              rich_text: [
-                {
-                  type: 'text',
-                  text: {
-                    content: content
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      }),
-      muteHttpExceptions: true
-    };
-    
-    UrlFetchApp.fetch(blocksUrl, addOptions);
   } catch (error) {
     Logger.log(`Warning: Could not update page content: ${error.message}`);
   }
@@ -1370,310 +994,48 @@ function updateNotionPageContent(pageId, content) {
 /**
  * Create a page in Notion database
  * @param {Object} bookmark - Raindrop bookmark object
- * @param {string} parentId - Optional parent page ID (not used for Twitter anymore)
  * @returns {Object} Created page response
  */
-function createNotionPage(bookmark, parentId = null) {
-  // Only throw error for Twitter bookmarks that should be in Twitter collection
-  // AND when Twitter organization is enabled
-  // Allow Twitter URLs from other collections (like Articles) to be created as regular pages
-  // Also allow Twitter bookmarks when Twitter organization is disabled
-  if (CONFIG.ENABLE_TWITTER_ORGANIZATION &&
-      isTwitterUrl(bookmark.link) && 
-      (bookmark.collectionName === 'Twitter' || bookmark.collectionName === 'Unsorted')) {
+function createNotionPage(bookmark) {
+  if (isOrganizedTwitterBookmark(bookmark)) {
     throw new Error('Twitter bookmarks in Twitter collection should be handled by addTweetsToParentPage function');
   }
-  
-  const url = `${CONFIG.NOTION_API_BASE}/pages`;
-  
-  // Prepare the page properties for database items
-  const titleProp = getDatabaseTitlePropertyName();
-  const properties = {
-    [titleProp]: {
-      title: [
-        {
-          text: {
-            content: pageTitle(bookmark)
-          }
-        }
-      ]
-    },
-    'Raindrop ID': {
-      rich_text: [
-        {
-          text: {
-            content: bookmark._id.toString()
-          }
-        }
-      ]
-    },
-    'URL': {
-      url: bookmark.link
-    },
-    'Type': {
-      select: {
-        name: bookmark.type || 'link'
-      }
-    },
-    'Collection': {
-      select: {
-        name: bookmark.collectionName || 'Unsorted'
-      }
-    },
-    'Date Saved': {
-      date: {
-        start: bookmark.created
-      }
-    }
-  };
-  
-  // Add tags if present
-  if (bookmark.tags && bookmark.tags.length > 0) {
-    properties['Tags'] = {
-      multi_select: bookmark.tags.map(tag => ({ name: tag }))
-    };
-  }
-  
-  // Create as database item
+
   const pageData = {
     parent: { database_id: CONFIG.NOTION_DATABASE_ID },
-    properties: properties
+    properties: {
+      ...bookmarkProperties(bookmark, getDatabaseTitlePropertyName()),
+      'Raindrop ID': richTextProperty(bookmark._id.toString()),
+      'URL': urlProperty(bookmark.link),
+      'Date Saved': dateProperty(bookmark.created)
+    },
+    ...coverAndIcon(bookmark)
   };
-  
-  // Add cover image if present and enabled
-  if (CONFIG.ENABLE_COVERS && bookmark.cover) {
-    // Handle both string URLs and object formats
-    const coverUrl = typeof bookmark.cover === 'string' ? bookmark.cover : bookmark.cover?.url;
-    if (coverUrl) {
-      pageData.cover = {
-        type: 'external',
-        external: {
-          url: coverUrl
-        }
-      };
-    }
-  }
-  
-  // Add icon if enabled (separate from cover)
-  if (CONFIG.ENABLE_ICONS && bookmark.cover) {
-    const coverUrl = typeof bookmark.cover === 'string' ? bookmark.cover : bookmark.cover?.url;
-    if (coverUrl) {
-      pageData.icon = {
-        type: 'external',
-        external: {
-          url: coverUrl
-        }
-      };
-    }
-  }
-  
+
   if (CONFIG.ENABLE_PAGE_CONTENT) {
-    const children = bookmarkContentBlocks(bookmark).slice(0, CONFIG.MAX_BLOCKS_PER_REQUEST);
+    const children = bookmarkContentBlocks(bookmark);
     if (children.length > 0) {
       pageData.children = children;
     }
   }
 
-  const options = {
-    method: 'post',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-      'Notion-Version': CONFIG.NOTION_API_VERSION,
-      'Content-Type': 'application/json'
-    },
-    payload: JSON.stringify(pageData),
-    muteHttpExceptions: true
-  };
-  
-  return makeRequestWithRetry(() => {
-    const response = UrlFetchApp.fetch(url, options);
-    const code = response.getResponseCode();
-    
-    if (code === 429) {
-      Logger.log('⚠️ Rate limited by Notion API, waiting...');
-      Utilities.sleep(CONFIG.DELAY_ON_RATE_LIMIT);
-      throw new Error('Rate limited');
-    }
-    
-    if (code !== 200) {
-      throw new Error(`Notion API error: ${code} - ${response.getContentText()}`);
-    }
-    
-    return JSON.parse(response.getContentText());
-  });
+  return notionRequest('post', '/pages', pageData, { idempotent: false });
 }
 
 /**
- * Create a Twitter bookmark as a child page inside a Twitter parent page
- * @param {Object} bookmark - Raindrop bookmark object
- * @param {string} parentId - Parent page ID
- * @returns {Object} Created page response
- */
-function createTwitterChildPage(bookmark, parentId) {
-  const url = `${CONFIG.NOTION_API_BASE}/pages`;
-  
-  const pageData = {
-    parent: { page_id: parentId },
-    properties: {
-      title: {
-        title: [
-          {
-            text: {
-              content: pageTitle(bookmark)
-            }
-          }
-        ]
-      }
-    },
-    children: [
-      {
-        object: 'block',
-        type: 'paragraph',
-        paragraph: {
-          rich_text: [
-            {
-              type: 'text',
-              text: {
-                content: `🔗 `,
-                link: null
-              }
-            },
-            {
-              type: 'text',
-              text: {
-                content: bookmark.link,
-                link: { url: bookmark.link }
-              }
-            }
-          ]
-        }
-      }
-    ]
-  };
-  
-  // Add cover image if present and enabled
-  if (CONFIG.ENABLE_COVERS && bookmark.cover) {
-    // Handle both string URLs and object formats
-    const coverUrl = typeof bookmark.cover === 'string' ? bookmark.cover : bookmark.cover?.url;
-    if (coverUrl) {
-      pageData.cover = {
-        type: 'external',
-        external: {
-          url: coverUrl
-        }
-      };
-    }
-  }
-  
-  // Add icon if enabled (separate from cover)
-  if (CONFIG.ENABLE_ICONS && bookmark.cover) {
-    const coverUrl = typeof bookmark.cover === 'string' ? bookmark.cover : bookmark.cover?.url;
-    if (coverUrl) {
-      pageData.icon = {
-        type: 'external',
-        external: {
-          url: coverUrl
-        }
-      };
-    }
-  }
-  
-  // Add excerpt/note as additional content if present and enabled
-  if (CONFIG.ENABLE_PAGE_CONTENT && (bookmark.excerpt || bookmark.note)) {
-    const content = bookmark.excerpt || bookmark.note;
-    pageData.children.push({
-      object: 'block',
-      type: 'paragraph',
-      paragraph: {
-        rich_text: [
-          {
-            type: 'text',
-            text: {
-              content: content
-            }
-          }
-        ]
-      }
-    });
-  }
-  
-  // Add tags as a bulleted list if present
-  if (bookmark.tags && bookmark.tags.length > 0) {
-    pageData.children.push({
-      object: 'block',
-      type: 'paragraph',
-      paragraph: {
-        rich_text: [
-          {
-            type: 'text',
-            text: {
-              content: `🏷️ Tags: ${bookmark.tags.join(', ')}`
-            }
-          }
-        ]
-      }
-    });
-  }
-  
-  // Add metadata
-  pageData.children.push({
-    object: 'block',
-    type: 'paragraph',
-    paragraph: {
-      rich_text: [
-        {
-          type: 'text',
-          text: {
-            content: `📅 Saved: ${bookmark.created || 'Unknown'} | 📁 Collection: ${bookmark.collectionName || 'Unsorted'} | 🆔 Raindrop ID: ${bookmark._id}`
-          }
-        }
-      ]
-    }
-  });
-  
-  const options = {
-    method: 'post',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-      'Notion-Version': CONFIG.NOTION_API_VERSION,
-      'Content-Type': 'application/json'
-    },
-    payload: JSON.stringify(pageData),
-    muteHttpExceptions: true
-  };
-  
-  return makeRequestWithRetry(() => {
-    const response = UrlFetchApp.fetch(url, options);
-    const code = response.getResponseCode();
-    
-    if (code === 429) {
-      Logger.log('⚠️ Rate limited by Notion API, waiting...');
-      Utilities.sleep(CONFIG.DELAY_ON_RATE_LIMIT);
-      throw new Error('Rate limited');
-    }
-    
-    if (code !== 200) {
-      throw new Error(`Notion API error: ${code} - ${response.getContentText()}`);
-    }
-    
-    return JSON.parse(response.getContentText());
-  });
-}
-
-/**
- * Create multiple pages in Notion using batch API (via individual calls)
+ * Create multiple pages in Notion
  * Note: Notion doesn't have a true batch create API, so we batch our calls
  * @param {Array} bookmarks - Array of bookmark objects
- * @param {string} parentId - Optional parent page ID
+ * @param {Set} existingIdsSet - Optional set to record created Raindrop IDs in
  * @returns {number} Number of successfully created pages
  */
-function createNotionPagesBatch(bookmarks, parentId = null, existingIdsSet = null) {
+function createNotionPagesBatch(bookmarks, existingIdsSet = null) {
   let successCount = 0;
   let failureCount = 0;
   
   for (let i = 0; i < bookmarks.length; i++) {
     try {
-      const created = createNotionPage(bookmarks[i], parentId);
+      const created = createNotionPage(bookmarks[i]);
       if (existingIdsSet) existingIdsSet.add(bookmarks[i]._id.toString());
       successCount++;
       
@@ -1701,18 +1063,6 @@ function createNotionPagesBatch(bookmarks, parentId = null, existingIdsSet = nul
 }
 
 /**
- * Get Twitter logo icon URL
- * Returns the official Twitter/X logo for consistent icons
- * @param {string} username - Twitter username (without @) - not used but kept for compatibility
- * @returns {string} Twitter logo URL
- */
-function getTwitterProfilePicUrl(username) {
-  // Use the official X (Twitter) logo
-  // This is more reliable than trying to fetch individual profile pictures
-  return 'https://abs.twimg.com/icons/apple-touch-icon-192x192.png';
-}
-
-/**
  * Create or get a Twitter parent page
  * @param {string} username - Twitter handle (with or without @)
  * @param {Object} twitterParents - Cache of existing parent pages
@@ -1722,187 +1072,70 @@ function getTwitterProfilePicUrl(username) {
  */
 function getOrCreateTwitterParent(username, twitterParents, latestBookmark = null, allUserBookmarks = []) {
   const handle = username.startsWith('@') ? username : `@${username}`;
-  const usernameOnly = username.startsWith('@') ? username.slice(1) : username;
-  
-  // Check cache first
+
   if (twitterParents[handle]) {
     return twitterParents[handle];
   }
-  
-  // Search for existing parent page
-  const url = `${CONFIG.NOTION_API_BASE}/databases/${CONFIG.NOTION_DATABASE_ID}/query`;
+
   const titleProp = getDatabaseTitlePropertyName();
-  
-  const payload = {
-    filter: {
-      and: [
-        {
-          property: titleProp,
-          title: { contains: handle }
-        },
-        {
-          property: 'Type',
-          select: { equals: 'tweets' }
-        }
-      ]
-    }
+  const filter = {
+    and: [
+      { property: titleProp, title: { contains: handle } },
+      { property: 'Type', select: { equals: 'tweets' } }
+    ]
   };
-  
-  const options = {
-    method: 'post',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-      'Notion-Version': CONFIG.NOTION_API_VERSION,
-      'Content-Type': 'application/json'
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-  
-  // Try to find existing parent with retries
-  const maxRetries = 3;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      const response = UrlFetchApp.fetch(url, options);
-      const code = response.getResponseCode();
-      
-      if (code !== 200) {
-        if (attempt < maxRetries - 1) {
-          Logger.log(`  ⚠️ Search for "${handle}" failed (${code}), retry ${attempt + 1}/${maxRetries - 1} in 3 seconds...`);
-          Utilities.sleep(3000);
-          continue;
-        } else {
-          Logger.log(`  ❌ Failed to search for "${handle}" after ${maxRetries} attempts`);
-          break; // Will create new parent page
-        }
-      }
-      
-      const data = JSON.parse(response.getContentText());
-      
-      if (data.results && data.results.length > 0) {
-        // Filter results to find exact match (handle should match exactly)
-        const exactMatch = data.results.find(page => {
-          const pageTitle = page.properties[titleProp]?.title?.[0]?.plain_text || '';
-          // Match either "@username on Twitter" or just "@username"
-          return pageTitle === `${handle} on Twitter` || pageTitle === handle;
-        });
-        
-        if (exactMatch) {
-          const pageId = exactMatch.id;
-          twitterParents[handle] = pageId;
-          
-          Logger.log(`  ✓ Found existing Twitter parent page for ${handle}`);
-          
-          // Update existing parent page with new tags if needed
-          updateTwitterParentTags(pageId, allUserBookmarks);
-          
-          return pageId;
-        } else {
-          Logger.log(`  ℹ️ Found ${data.results.length} pages containing "${handle}" but none matched exactly`);
-        }
-      }
-      
-      // Successfully searched but no match found, break and create new
-      break;
-      
-    } catch (error) {
-      if (attempt < maxRetries - 1) {
-        Logger.log(`  ⚠️ Error searching for "${handle}": ${error.message}, retrying...`);
-        Utilities.sleep(3000);
-      } else {
-        Logger.log(`  ❌ Failed to search for "${handle}" after ${maxRetries} attempts: ${error.message}`);
-      }
+
+  // A failed search throws instead of creating a second parent page for the same user
+  let candidates = 0;
+  for (const page of queryDatabase(filter)) {
+    candidates++;
+    const title = page.properties[titleProp]?.title?.[0]?.plain_text || '';
+
+    if (title === `${handle} on Twitter` || title === handle) {
+      twitterParents[handle] = page.id;
+      Logger.log(`  ✓ Found existing Twitter parent page for ${handle}`);
+      updateTwitterParentTags(page.id, allUserBookmarks);
+      return page.id;
     }
   }
-  
-  // Collect all unique tags from user's bookmarks
-  const allTags = new Set();
-  allUserBookmarks.forEach(bookmark => {
-    if (bookmark.tags && Array.isArray(bookmark.tags)) {
-      bookmark.tags.forEach(tag => allTags.add(tag));
-    }
-  });
-  
-  // Create new parent page
+
+  if (candidates > 0) {
+    Logger.log(`  ℹ️ Found ${candidates} pages containing "${handle}" but none matched exactly`);
+  }
+
   Logger.log(`Creating Twitter parent page: ${handle}`);
-  
-  const createUrl = `${CONFIG.NOTION_API_BASE}/pages`;
-  const createPayload = {
-    parent: {
-      database_id: CONFIG.NOTION_DATABASE_ID
-    },
-    properties: {
-      [titleProp]: {
-        title: [
-          {
-            text: {
-              content: `${handle} on Twitter`
-            }
-          }
-        ]
-      },
-      'Type': {
-        select: {
-          name: 'tweets'
-        }
-      },
-      'Collection': {
-        select: {
-          name: 'Twitter'
-        }
-      },
-      'Date Saved': {
-        date: {
-          start: latestBookmark ? latestBookmark.created : new Date().toISOString()
-        }
-      }
-    }
+
+  const properties = {
+    [titleProp]: titleProperty(`${handle} on Twitter`),
+    'Type': selectProperty('tweets'),
+    'Collection': selectProperty('Twitter'),
+    'Date Saved': dateProperty(latestBookmark ? latestBookmark.created : new Date().toISOString())
   };
-  
-  // Add tags if present
-  if (allTags.size > 0) {
-    createPayload.properties['Tags'] = {
-      multi_select: Array.from(allTags).map(tag => ({ name: tag }))
-    };
-    Logger.log(`Adding tags to ${handle}: ${Array.from(allTags).join(', ')}`);
+
+  const tags = collectTags(allUserBookmarks);
+  if (tags.length > 0) {
+    properties['Tags'] = multiSelectProperty(tags);
+    Logger.log(`Adding tags to ${handle}: ${tags.join(', ')}`);
   }
-  
-  // Add Twitter logo as page icon if enabled
+
+  const pageData = {
+    parent: { database_id: CONFIG.NOTION_DATABASE_ID },
+    properties: properties
+  };
+
   if (CONFIG.ENABLE_TWITTER_ICONS) {
-    try {
-      const profilePicUrl = getTwitterProfilePicUrl(usernameOnly);
-      createPayload.icon = {
-        type: 'external',
-        external: {
-          url: profilePicUrl
-        }
-      };
-      Logger.log(`Adding Twitter logo icon for ${handle}`);
-    } catch (error) {
-      Logger.log(`Warning: Could not add Twitter logo for ${handle}: ${error.message}`);
-    }
+    pageData.icon = externalFile(TWITTER_ICON_URL);
+    Logger.log(`Adding Twitter logo icon for ${handle}`);
   }
-  
-  const createOptions = {
-    method: 'post',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-      'Notion-Version': CONFIG.NOTION_API_VERSION,
-      'Content-Type': 'application/json'
-    },
-    payload: JSON.stringify(createPayload),
-    muteHttpExceptions: true
-  };
-  
-  const createResponse = UrlFetchApp.fetch(createUrl, createOptions);
-  const createdPage = JSON.parse(createResponse.getContentText());
-  
-  if (createdPage.id) {
-    twitterParents[handle] = createdPage.id;
-    return createdPage.id;
+
+  const createdPage = notionRequest('post', '/pages', pageData, { idempotent: false });
+
+  if (!createdPage.id) {
+    throw new Error(`Failed to create Twitter parent page for ${handle}`);
   }
-  
-  throw new Error(`Failed to create Twitter parent page for ${handle}`);
+
+  twitterParents[handle] = createdPage.id;
+  return createdPage.id;
 }
 
 /**
@@ -1912,44 +1145,11 @@ function getOrCreateTwitterParent(username, twitterParents, latestBookmark = nul
  */
 function updateTwitterParentTags(pageId, userBookmarks) {
   try {
-    // Collect all unique tags from user's bookmarks
-    const allTags = new Set();
-    userBookmarks.forEach(bookmark => {
-      if (bookmark.tags && Array.isArray(bookmark.tags)) {
-        bookmark.tags.forEach(tag => allTags.add(tag));
-      }
-    });
-    
-    if (allTags.size === 0) return; // No tags to add
-    
-    // Update the page with tags
-    const updateUrl = `${CONFIG.NOTION_API_BASE}/pages/${pageId}`;
-    const updatePayload = {
-      properties: {
-        'Tags': {
-          multi_select: Array.from(allTags).map(tag => ({ name: tag }))
-        }
-      }
-    };
-    
-    const updateOptions = {
-      method: 'patch',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION,
-        'Content-Type': 'application/json'
-      },
-      payload: JSON.stringify(updatePayload),
-      muteHttpExceptions: true
-    };
-    
-    const updateResponse = UrlFetchApp.fetch(updateUrl, updateOptions);
-    
-    if (updateResponse.getResponseCode() === 200) {
-      Logger.log(`✓ Updated parent page tags: ${Array.from(allTags).join(', ')}`);
-    } else {
-      Logger.log(`Warning: Failed to update parent page tags: ${updateResponse.getContentText()}`);
-    }
+    const tags = collectTags(userBookmarks);
+    if (tags.length === 0) return;
+
+    notionRequest('patch', `/pages/${pageId}`, { properties: { 'Tags': multiSelectProperty(tags) } });
+    Logger.log(`✓ Updated parent page tags: ${tags.join(', ')}`);
   } catch (error) {
     Logger.log(`Warning: Error updating parent page tags: ${error.message}`);
   }
@@ -1959,6 +1159,12 @@ function updateTwitterParentTags(pageId, userBookmarks) {
 // PROCESSING FUNCTIONS
 // ============================================================================
 
+function isOrganizedTwitterBookmark(bookmark) {
+  return CONFIG.ENABLE_TWITTER_ORGANIZATION &&
+    isTwitterUrl(bookmark.link) &&
+    (bookmark.collectionName === 'Twitter' || bookmark.collectionName === 'Unsorted');
+}
+
 /**
  * Check if a bookmark needs updating by comparing with Notion page
  * @param {string} pageId - Notion page ID
@@ -1967,101 +1173,33 @@ function updateTwitterParentTags(pageId, userBookmarks) {
  */
 function bookmarkNeedsUpdate(pageId, bookmark) {
   try {
-    const url = `${CONFIG.NOTION_API_BASE}/pages/${pageId}`;
-    const options = {
-      method: 'get',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION
-      },
-      muteHttpExceptions: true
-    };
-    
-    const response = UrlFetchApp.fetch(url, options);
-    if (response.getResponseCode() !== 200) return false;
-    
-    const page = JSON.parse(response.getContentText());
+    const page = notionRequest('get', `/pages/${pageId}`);
     const props = page.properties;
     const titleProp = getDatabaseTitlePropertyName();
-    
-    // Check title
-    const currentTitle = props[titleProp]?.title?.[0]?.plain_text || '';
-    const newTitle = pageTitle(bookmark);
-    if (currentTitle !== newTitle) return true;
-    
-    // Check type
-    const currentType = props['Type']?.select?.name || '';
-    const newType = bookmark.type || 'link';
-    if (currentType !== newType) return true;
-    
-    // Check collection
-    const currentCollection = props['Collection']?.select?.name || '';
-    const newCollection = bookmark.collectionName || 'Unsorted';
-    if (currentCollection !== newCollection) return true;
-    
-    // Check tags
+
+    if ((props[titleProp]?.title?.[0]?.plain_text || '') !== pageTitle(bookmark)) return true;
+    if ((props['Type']?.select?.name || '') !== (bookmark.type || 'link')) return true;
+    if ((props['Collection']?.select?.name || '') !== (bookmark.collectionName || 'Unsorted')) return true;
+
     const currentTags = (props['Tags']?.multi_select || []).map(t => t.name).sort();
-    const newTags = (bookmark.tags || []).sort();
-    if (currentTags.length !== newTags.length) return true;
-    for (let i = 0; i < currentTags.length; i++) {
-      if (currentTags[i] !== newTags[i]) return true;
-    }
-    
-    // Check cover image
-    const currentCover = page.cover?.external?.url || '';
-    const newCoverUrl = bookmark.cover ? (typeof bookmark.cover === 'string' ? bookmark.cover : bookmark.cover?.url) : '';
-    if (currentCover !== newCoverUrl) return true;
-    
-    // Check note/excerpt content if enabled
+    const newTags = [...(bookmark.tags || [])].sort();
+    if (currentTags.length !== newTags.length || currentTags.some((tag, i) => tag !== newTags[i])) return true;
+
+    if ((page.cover?.external?.url || '') !== bookmarkCoverUrl(bookmark)) return true;
+
     if (CONFIG.ENABLE_PAGE_CONTENT) {
-      // Get the page's content blocks to compare note/excerpt
       try {
-        const blocksUrl = `${CONFIG.NOTION_API_BASE}/blocks/${pageId}/children`;
-        const blockOptions = {
-          method: 'get',
-          headers: {
-            'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-            'Notion-Version': CONFIG.NOTION_API_VERSION
-          },
-          muteHttpExceptions: true
-        };
-        
-        const blockResponse = UrlFetchApp.fetch(blocksUrl, blockOptions);
-        const blocks = JSON.parse(blockResponse.getContentText());
-        
-        // Extract current content from blocks (both paragraph and quote blocks)
-        let currentContent = '';
-        if (blocks.results) {
-          for (const block of blocks.results) {
-            if (block.type === 'paragraph' && block.paragraph?.rich_text) {
-              // Concatenate all rich_text elements in the paragraph
-              for (const text of block.paragraph.rich_text) {
-                currentContent += text.plain_text || '';
-              }
-            } else if (block.type === 'quote' && block.quote?.rich_text) {
-              // Concatenate all rich_text elements in the quote
-              for (const text of block.quote.rich_text) {
-                currentContent += text.plain_text || '';
-              }
-            }
-          }
-        }
-        
-        // Build expected content from bookmark (excerpt + note)
-        let newContent = '';
-        if (bookmark.excerpt) newContent += bookmark.excerpt;
-        if (bookmark.note) newContent += bookmark.note;
-        
-        if (currentContent.trim() !== newContent.trim()) {
-          return true;
-        }
+        const currentContent = contentBlocksText(Array.from(listBlockChildren(pageId)));
+        const newContent = (bookmark.excerpt || '') + (bookmark.note || '');
+
+        if (currentContent.trim() !== newContent.trim()) return true;
       } catch (error) {
         Logger.log(`  ⚠️ Could not check content blocks: ${error.message}`);
       }
     }
-    
-    return false; // No changes detected
-    
+
+    return false;
+
   } catch (error) {
     Logger.log(`  ⚠️ Error checking if bookmark needs update: ${error.message}`);
     return false; // Assume no update needed if we can't check
@@ -2131,224 +1269,37 @@ function checkAndUpdateBookmarks(bookmarks, idToPageMap, startTime) {
 }
 
 /**
- * Update Twitter child blocks (tweets within parent pages)
- * @param {string} parentPageId - Parent page ID
- * @param {Object} bookmark - Updated bookmark data
- * @param {Array} blockIds - Block IDs to update
- * @returns {boolean} True if updated
- */
-function updateTwitterChildBlocks(parentPageId, bookmark, blockIds) {
-  try {
-    // For now, we'll delete the old blocks and recreate them
-    // This is simpler than trying to update individual blocks
-    
-    // Delete old blocks
-    for (const blockId of blockIds) {
-      try {
-        deleteNotionBlock(blockId);
-        Utilities.sleep(100);
-      } catch (error) {
-        Logger.log(`  Warning: Could not delete block ${blockId}: ${error.message}`);
-      }
-    }
-    
-    // Add updated tweet content
-    const blocks = [];
-    const maxChunkSize = 1900;
-    
-    // Add title if available
-    if (bookmark.title) {
-      if (bookmark.title.length <= maxChunkSize) {
-        blocks.push({
-          object: 'block',
-          type: 'paragraph',
-          paragraph: {
-            rich_text: [{
-              type: 'text',
-              text: { content: bookmark.title }
-            }]
-          }
-        });
-      } else {
-        let remainingContent = bookmark.title;
-        while (remainingContent.length > 0) {
-          const chunk = remainingContent.substring(0, maxChunkSize);
-          remainingContent = remainingContent.substring(maxChunkSize);
-          blocks.push({
-            object: 'block',
-            type: 'paragraph',
-            paragraph: {
-              rich_text: [{
-                type: 'text',
-                text: { content: chunk }
-              }]
-            }
-          });
-        }
-      }
-    }
-    
-    // Add excerpt if available
-    if (bookmark.excerpt) {
-      if (bookmark.excerpt.length <= maxChunkSize) {
-        blocks.push({
-          object: 'block',
-          type: 'paragraph',
-          paragraph: {
-            rich_text: [{
-              type: 'text',
-              text: { content: bookmark.excerpt }
-            }]
-          }
-        });
-      } else {
-        let remainingContent = bookmark.excerpt;
-        while (remainingContent.length > 0) {
-          const chunk = remainingContent.substring(0, maxChunkSize);
-          remainingContent = remainingContent.substring(maxChunkSize);
-          blocks.push({
-            object: 'block',
-            type: 'paragraph',
-            paragraph: {
-              rich_text: [{
-                type: 'text',
-                text: { content: chunk }
-              }]
-            }
-          });
-        }
-      }
-    }
-    
-    // Add note if available - as a quote block
-    if (bookmark.note) {
-      if (bookmark.note.length <= maxChunkSize) {
-        blocks.push({
-          object: 'block',
-          type: 'quote',
-          quote: {
-            rich_text: [{
-              type: 'text',
-              text: { content: bookmark.note }
-            }],
-            color: 'default'
-          }
-        });
-      } else {
-        let remainingContent = bookmark.note;
-        while (remainingContent.length > 0) {
-          const chunk = remainingContent.substring(0, maxChunkSize);
-          remainingContent = remainingContent.substring(maxChunkSize);
-          blocks.push({
-            object: 'block',
-            type: 'quote',
-            quote: {
-              rich_text: [{
-                type: 'text',
-                text: { content: chunk }
-              }],
-              color: 'default'
-            }
-          });
-        }
-      }
-    }
-    
-    // Add metadata with Raindrop ID
-    blocks.push({
-      object: 'block',
-      type: 'paragraph',
-      paragraph: {
-        rich_text: [{
-          type: 'text',
-          text: {
-            content: `📅 Saved: ${formatDate(bookmark.created)} | 🆔 Raindrop ID: ${bookmark._id}`
-          }
-        }]
-      }
-    });
-    
-    // Add link
-    blocks.push({
-      object: 'block',
-      type: 'paragraph',
-      paragraph: {
-        rich_text: [{
-          type: 'text',
-          text: {
-            content: bookmark.link,
-            link: { url: bookmark.link }
-          }
-        }]
-      }
-    });
-    
-    // Add spacing (3 empty lines)
-    for (let j = 0; j < 3; j++) {
-      blocks.push({
-        object: 'block',
-        type: 'paragraph',
-        paragraph: { rich_text: [] }
-      });
-    }
-    
-    // Append new blocks
-    const url = `${CONFIG.NOTION_API_BASE}/blocks/${parentPageId}/children`;
-    const options = {
-      method: 'patch',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION,
-        'Content-Type': 'application/json'
-      },
-      payload: JSON.stringify({ children: blocks }),
-      muteHttpExceptions: true
-    };
-    
-    const response = UrlFetchApp.fetch(url, options);
-    if (response.getResponseCode() === 200) {
-      Logger.log(`  ✓ Updated Twitter bookmark: ${bookmark.title || bookmark.link}`);
-      return true;
-    }
-    
-    return false;
-  } catch (error) {
-    Logger.log(`  ❌ Error updating Twitter blocks: ${error.message}`);
-    return false;
-  }
-}
-
-/**
  * Process regular (non-Twitter) bookmarks in batches
  * @param {Array} bookmarks - Array of bookmark objects
- * @param {string} parentId - Optional parent page ID
+ * @param {Set} existingIdsSet - Optional set to record created Raindrop IDs in
  * @returns {number} Number of created pages
  */
-function processBatchBookmarks(bookmarks, parentId = null, existingIdsSet = null) {
+function processBatchBookmarks(bookmarks, existingIdsSet = null) {
   let totalCreated = 0;
-  
-  // Process in batches
+
   for (let i = 0; i < bookmarks.length; i += CONFIG.BATCH_SIZE) {
     const batch = bookmarks.slice(i, i + CONFIG.BATCH_SIZE);
-    Logger.log(`Creating batch ${Math.floor(i / CONFIG.BATCH_SIZE) + 1}: ${batch.length} pages`);
-    
-      const created = createNotionPagesBatch(batch, parentId, existingIdsSet);
-      totalCreated += created;
-      
-      if (created < batch.length) {
-        logError('WARNING', `Only created ${created} of ${batch.length} pages in batch`, {
-          batchNumber: Math.floor(i / CONFIG.BATCH_SIZE) + 1,
-          expected: batch.length,
-          actual: created
-        });
-      }
-      
-      Logger.log(`✓ Created ${created} pages in this batch`);    // Delay between batches
+    const batchNumber = Math.floor(i / CONFIG.BATCH_SIZE) + 1;
+    Logger.log(`Creating batch ${batchNumber}: ${batch.length} pages`);
+
+    const created = createNotionPagesBatch(batch, existingIdsSet);
+    totalCreated += created;
+
+    if (created < batch.length) {
+      logError('WARNING', `Only created ${created} of ${batch.length} pages in batch`, {
+        batchNumber: batchNumber,
+        expected: batch.length,
+        actual: created
+      });
+    }
+
+    Logger.log(`✓ Created ${created} pages in this batch`);
+
     if (i + CONFIG.BATCH_SIZE < bookmarks.length) {
       Utilities.sleep(CONFIG.DELAY_BETWEEN_BATCHES);
     }
   }
-  
+
   return totalCreated;
 }
 
@@ -2406,46 +1357,6 @@ function processTwitterBookmarks(bookmarks, twitterParents, existingIdsSet = nul
   return totalCreated;
 }
 
-const TWEET_TRAILER_BLOCKS = 5;
-
-function buildTweetBlocks(tweet) {
-  const trailer = [
-    {
-      object: 'block',
-      type: 'paragraph',
-      paragraph: {
-        rich_text: [{
-          type: 'text',
-          text: { content: `📅 Saved: ${formatDate(tweet.created)} | 🆔 Raindrop ID: ${tweet._id}` }
-        }]
-      }
-    },
-    {
-      object: 'block',
-      type: 'paragraph',
-      paragraph: {
-        rich_text: [{
-          type: 'text',
-          text: { content: tweet.link, link: { url: tweet.link } }
-        }]
-      }
-    },
-    ...[1, 2, 3].map(() => ({
-      object: 'block',
-      type: 'paragraph',
-      paragraph: { rich_text: [] }
-    }))
-  ];
-
-  const content = [
-    ...textBlocks('paragraph', tweet.title),
-    ...textBlocks('paragraph', tweet.excerpt),
-    ...textBlocks('quote', tweet.note)
-  ].slice(0, CONFIG.MAX_BLOCKS_PER_REQUEST - trailer.length);
-
-  return [...content, ...trailer];
-}
-
 function groupTweetsIntoRequests(tweets) {
   const requests = [];
   let current = { tweets: [], blocks: [] };
@@ -2476,7 +1387,7 @@ function groupTweetsIntoRequests(tweets) {
  * @returns {Array} Raindrop IDs of the tweets that were actually added
  */
 function addTweetsToParentPage(parentId, tweets) {
-  const existingIds = new Set(getTwitterChildrenRaindropIds(parentId).map(t => t.raindropId));
+  const existingIds = new Set(getTwitterChildBlocksWithRaindropIds(parentId).map(t => t.raindropId));
   const newTweets = tweets.filter(tweet => !existingIds.has(tweet._id.toString()));
 
   if (newTweets.length === 0) {
@@ -2488,27 +1399,15 @@ function addTweetsToParentPage(parentId, tweets) {
     Logger.log(`  ℹ️ Skipping ${tweets.length - newTweets.length} existing tweets, adding ${newTweets.length} new tweets...`);
   }
 
-  const url = `${CONFIG.NOTION_API_BASE}/blocks/${parentId}/children`;
   const addedIds = [];
 
   for (const request of groupTweetsIntoRequests(newTweets)) {
-    const response = UrlFetchApp.fetch(url, {
-      method: 'patch',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION,
-        'Content-Type': 'application/json'
-      },
-      payload: JSON.stringify({ children: request.blocks }),
-      muteHttpExceptions: true
-    });
-    const code = response.getResponseCode();
-
-    if (code !== 200) {
+    try {
+      notionRequest('patch', `/blocks/${parentId}/children`, { children: request.blocks }, { idempotent: false });
+    } catch (error) {
       logError('ERROR', `Failed to add ${request.tweets.length} tweets to parent page`, {
         parentId: parentId,
-        code: code,
-        response: response.getContentText()
+        error: error.message
       });
       break;
     }
@@ -2533,39 +1432,10 @@ function addTweetsToParentPage(parentId, tweets) {
  */
 function updateParentPageDateSaved(pageId, dateString) {
   try {
-    const url = `${CONFIG.NOTION_API_BASE}/pages/${pageId}`;
-    
-    const payload = {
-      properties: {
-        'Date Saved': {
-          date: {
-            start: dateString
-          }
-        }
-      }
-    };
-    
-    const options = {
-      method: 'patch',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION,
-        'Content-Type': 'application/json'
-      },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    };
-    
-    const response = UrlFetchApp.fetch(url, options);
-    const code = response.getResponseCode();
-    
-    if (code === 200) {
-      Logger.log(`  ✓ Updated parent page Date Saved to ${formatDate(dateString)}`);
-    } else {
-      Logger.log(`  ⚠️ Warning: Could not update Date Saved: ${code} - ${response.getContentText()}`);
-    }
+    notionRequest('patch', `/pages/${pageId}`, { properties: { 'Date Saved': dateProperty(dateString) } });
+    Logger.log(`  ✓ Updated parent page Date Saved to ${formatDate(dateString)}`);
   } catch (error) {
-    Logger.log(`  ⚠️ Warning: Error updating Date Saved: ${error.message}`);
+    Logger.log(`  ⚠️ Warning: Could not update Date Saved: ${error.message}`);
   }
 }
 
@@ -2579,42 +1449,17 @@ function updateParentPageDateSaved(pageId, dateString) {
  */
 function confirmFirstRun() {
   try {
-    const url = `${CONFIG.NOTION_API_BASE}/databases/${CONFIG.NOTION_DATABASE_ID}/query`;
-    
-    const payload = {
-      page_size: 1 // Just check if any pages exist
-    };
-    
-    const options = {
-      method: 'post',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-        'Notion-Version': CONFIG.NOTION_API_VERSION,
-        'Content-Type': 'application/json'
-      },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    };
-    
-    const response = UrlFetchApp.fetch(url, options);
-    const responseCode = response.getResponseCode();
-    
-    if (responseCode !== 200) {
-      Logger.log(`Warning: Cannot verify first run status: ${response.getContentText()}`);
-      return false; // Err on side of caution
-    }
-    
-    const data = JSON.parse(response.getContentText());
+    const data = notionRequest('post', `/databases/${CONFIG.NOTION_DATABASE_ID}/query`, { page_size: 1 });
     const isEmpty = !data.results || data.results.length === 0;
-    
+
     if (isEmpty) {
       Logger.log('✓ Database appears to be empty - confirming first run');
       return true;
-    } else {
-      Logger.log(`⚠️ Database contains ${data.results.length > 0 ? 'pages' : 'no pages'} but no Raindrop IDs found`);
-      return false;
     }
-    
+
+    Logger.log('⚠️ Database contains pages but no Raindrop IDs found');
+    return false;
+
   } catch (error) {
     Logger.log(`Warning: Error checking first run status: ${error.message}`);
     return false; // Err on side of caution to prevent duplicates
@@ -2666,74 +1511,6 @@ function extractTwitterHandle(url) {
   return TWITTER_RESERVED_PATHS.includes(username) ? null : username;
 }
 
-function splitText(text, size = CONFIG.MAX_TEXT_CHUNK) {
-  const chunks = [];
-  let start = 0;
-
-  while (start < text.length) {
-    let end = Math.min(start + size, text.length);
-    const lastUnit = text.charCodeAt(end - 1);
-    if (end < text.length && lastUnit >= 0xD800 && lastUnit <= 0xDBFF) end--;
-    chunks.push(text.substring(start, end));
-    start = end;
-  }
-
-  return chunks;
-}
-
-function textBlocks(type, text) {
-  if (!text) return [];
-
-  return splitText(text).map(chunk => ({
-    object: 'block',
-    type: type,
-    [type]: { rich_text: [{ type: 'text', text: { content: chunk } }] }
-  }));
-}
-
-function bookmarkContentBlocks(bookmark) {
-  return [
-    ...textBlocks('paragraph', bookmark.excerpt),
-    ...textBlocks('quote', bookmark.note)
-  ];
-}
-
-function pageTitle(bookmark) {
-  return splitText(bookmark.title || bookmark.link || 'Untitled')[0];
-}
-
-/**
- * Make an API request with retry logic
- * @param {Function} requestFn - Function that makes the API request
- * @returns {Object} Response from the request
- */
-function makeRequestWithRetry(requestFn) {
-  let lastError;
-  
-  for (let attempt = 0; attempt < CONFIG.MAX_RETRIES; attempt++) {
-    try {
-      return requestFn();
-    } catch (error) {
-      lastError = error;
-      
-      if (error.message.includes('Rate limited')) {
-        // Rate limit errors should always retry
-        Logger.log(`Retry attempt ${attempt + 1}/${CONFIG.MAX_RETRIES} after rate limit`);
-        continue;
-      }
-      
-      if (attempt < CONFIG.MAX_RETRIES - 1) {
-        Logger.log(`Retry attempt ${attempt + 1}/${CONFIG.MAX_RETRIES}: ${error.message}`);
-        Utilities.sleep(1000 * (attempt + 1)); // Exponential backoff
-      }
-    }
-  }
-  
-  throw lastError;
-}
-
-
-
 /**
  * Log an error for tracking
  * @param {string} type - Error type (ERROR, WARNING, INFO)
@@ -2764,34 +1541,12 @@ function logError(type, message, details = {}) {
 let _cachedDbTitlePropName = null;
 
 /**
- * Fetch the Notion database schema
- * @returns {Object}
- */
-function fetchNotionDatabase() {
-  const url = `${CONFIG.NOTION_API_BASE}/databases/${CONFIG.NOTION_DATABASE_ID}`;
-  const options = {
-    method: 'get',
-    headers: {
-      'Authorization': `Bearer ${CONFIG.NOTION_API_TOKEN}`,
-      'Notion-Version': CONFIG.NOTION_API_VERSION
-    },
-    muteHttpExceptions: true
-  };
-  const resp = UrlFetchApp.fetch(url, options);
-  const code = resp.getResponseCode();
-  if (code !== 200) {
-    throw new Error(`Failed to fetch database schema: ${code} - ${resp.getContentText()}`);
-  }
-  return JSON.parse(resp.getContentText());
-}
-
-/**
  * Determine the database title property name (e.g., 'Name', 'Title', etc.)
  * @returns {string}
  */
 function getDatabaseTitlePropertyName() {
   if (_cachedDbTitlePropName) return _cachedDbTitlePropName;
-  const db = fetchNotionDatabase();
+  const db = notionRequest('get', `/databases/${CONFIG.NOTION_DATABASE_ID}`);
   const props = db.properties || {};
   for (const key in props) {
     if (props[key]?.type === 'title') {
@@ -2852,7 +1607,6 @@ function enrichBookmarksMetadata(bookmarks) {
 // ============================================================================
 // TRIGGER MANAGEMENT
 // ============================================================================
-
 
 /**
  * Delete all existing triggers for this script
