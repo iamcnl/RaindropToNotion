@@ -80,6 +80,8 @@ The `CONFIG` section at the top of the script provides several options for fine-
 | `ENABLE_UPDATE_CHECK`| Set to `false` to skip checking for updates on existing bookmarks. This speeds up the sync but won't reflect changes made in Raindrop after the initial import. |
 | `MAX_EXECUTION_TIME` | The script will stop gracefully before hitting the Google Apps Script 6-minute execution limit. You can lower this if needed. |
 | `TRIGGER_HOUR` | The hour (0-23) when the daily sync should run. |
+| `MAX_DELETIONS_PER_RUN` | Safety limit. A run that would archive more Notion pages than this aborts the delete step instead. |
+| `ALLOW_MASS_DELETION` | Set to `true` to override `MAX_DELETIONS_PER_RUN` when you really did remove that many bookmarks. |
 
 ## Management Functions
 The script includes a couple of helper functions for managing triggers, which you can run from the script editor:
